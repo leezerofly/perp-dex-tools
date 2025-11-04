@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+使用常驻进程的对冲机器人控制器
+- 三个 runbot_daemon.py 持续运行
+- 父进程通过 stdin/stdout 与子进程通信
+- 避免重复初始化，节省 API 调用
+"""
+
+import argparse
+import json
+import random
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from decimal import Decimal
+from typing import List, Optional
+
+
+# ANSI 颜色代码
+class Colors:
+    RED = '\033[91m'      # Bot1 - 红色
+    GREEN = '\033[92m'    # Bot2 - 绿色
+    YELLOW = '\033[93m'   # Bot3 - 黄色
+    BLUE = '\033[94m'     # 信息 - 蓝色
+    MAGENTA = '\033[95m'  # 其他
+    CYAN = '\033[96m'     # 其他
+    RESET = '\033[0m'     # 重置颜色
+    BOLD = '\033[1m'      # 粗体
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Lighter 对冲 - 守护进程版本')
+    parser.add_argument('--env1', required=True, help='账号1 .env 路径')
+    parser.add_argument('--env2', required=True, help='账号2 .env 路径')
+    parser.add_argument('--env3', required=True, help='账号3 .env 路径')
+    parser.add_argument('--config', default='hedge_config.json', help='对冲配置文件 格式: [["ticker", quantity, profit_pct, leverage], ...]')
+    parser.add_argument('--log-dir', default='./logs', help='日志输出目录')
+    parser.add_argument('--rounds', type=int, default=2000, help='运行轮数')
+    parser.add_argument('--interval', type=int, default=60, help='多轮之间的间隔秒数')
+    return parser.parse_args()
+
+
+def load_hedge_config(config_file: str) -> List[List]:
+    cfg_path = Path(config_file)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {config_file}")
+    data = json.loads(cfg_path.read_text(encoding='utf-8'))
+    if not isinstance(data, list) or not data:
+        raise ValueError('配置内容不合法或为空')
+    return data
+
+
+class DaemonBot:
+    """管理单个 runbot_daemon.py 守护进程"""
+    def __init__(self, bot_id: int, env_file: str, log_file: Optional[Path] = None):
+        self.bot_id = bot_id
+        self.env_file = env_file
+        self.log_file = log_file
+        self.log_fd = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.ready = False
+        
+        # 为每个 Bot 分配颜色
+        self.color = {
+            1: Colors.RED,
+            2: Colors.GREEN,
+            3: Colors.YELLOW
+        }.get(bot_id, Colors.RESET)
+        
+    def start(self):
+        """启动守护进程"""
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, 'runbot_daemon.py', '--env', self.env_file],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            
+            # 等待 ready 信号
+            response = self.proc.stdout.readline().strip()
+            data = json.loads(response)
+            if data.get('status') == 'ready':
+                self.ready = True
+                print(f"{self.color}✓ Bot{self.bot_id}{Colors.RESET} 守护进程已启动 (PID: {self.proc.pid})")
+                return True
+            else:
+                print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 启动失败: {data}")
+                return False
+                
+        except Exception as e:
+            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 启动异常: {e}")
+            return False
+    
+    def send_trade_command(self, ticker: str, quantity: Decimal, direction: str, 
+                          take_profit: Decimal, leverage: Decimal = Decimal('20')) -> bool:
+        """发送交易指令"""
+        if not self.proc or not self.ready:
+            return False
+        
+        try:
+            cmd = {
+                'action': 'trade',
+                'ticker': ticker,
+                'quantity': str(quantity),
+                'direction': direction,
+                'take_profit': str(take_profit),
+                'leverage': str(leverage)
+            }
+            
+            self.proc.stdin.write(json.dumps(cmd) + '\n')
+            self.proc.stdin.flush()
+            
+            print(f"  {self.color}→ Bot{self.bot_id}{Colors.RESET}: {direction} {quantity} {ticker} @ TP={take_profit}%")
+            return True
+            
+        except Exception as e:
+            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 发送指令失败: {e}")
+            return False
+    
+    def wait_for_completion(self, timeout: float = 7500) -> dict:
+        """等待交易完成，返回结果字典"""
+        if not self.proc:
+            return {'success': False, 'error': 'NO_PROC'}
+        
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                line = self.proc.stdout.readline()
+                if not line:
+                    return {'success': False, 'error': 'PIPE_CLOSED'}
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 写入日志文件
+                if self.log_fd:
+                    self.log_fd.write(line + '\n')
+                    self.log_fd.flush()
+                
+                try:
+                    response = json.loads(line)
+                    
+                    # 处理日志消息
+                    if response.get('type') == 'log':
+                        msg = response.get('message', '')
+                        print(f"    {self.color}[Bot{self.bot_id}]{Colors.RESET} {msg}")
+                        continue
+                    
+                    # 处理完成响应
+                    if 'success' in response:
+                        if response['success']:
+                            print(f"  {self.color}✓ Bot{self.bot_id}{Colors.RESET} 交易完成")
+                            return {'success': True}
+                        else:
+                            error = response.get('error', 'UNKNOWN')
+                            print(f"  {self.color}✗ Bot{self.bot_id}{Colors.RESET} 交易失败: {error}")
+                            # 如果是超时错误，返回特殊标记
+                            if error == 'TIMEOUT':
+                                return {'success': False, 'error': 'TIMEOUT', 'bot_id': self.bot_id}
+                            return {'success': False, 'error': error}
+                            
+                except json.JSONDecodeError:
+                    # 无法解析的行，可能是其他输出
+                    print(f"    {self.color}[Bot{self.bot_id}]{Colors.RESET} {line}")
+                    continue
+            
+            print(f"  {self.color}⏱ Bot{self.bot_id}{Colors.RESET} 等待超时（主进程超时）")
+            return {'success': False, 'error': 'MAIN_TIMEOUT'}
+            
+        except Exception as e:
+            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 等待异常: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def stop(self):
+        """停止守护进程"""
+        if self.proc:
+            try:
+                # 发送退出命令
+                cmd = {'action': 'exit'}
+                self.proc.stdin.write(json.dumps(cmd) + '\n')
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=5)
+            except:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except:
+                    self.proc.kill()
+            self.ready = False
+        
+        if self.log_fd:
+            self.log_fd.close()
+            self.log_fd = None
+
+
+def main():
+    args = parse_arguments()
+    
+    # 读取配置
+    hedge_items = load_hedge_config(args.config)
+    
+    # 验证 env 文件
+    for p in [args.env1, args.env2, args.env3]:
+        if not Path(p).exists():
+            print(f"错误: 环境文件不存在: {p}")
+            return 1
+    
+    # 创建日志目录
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 从环境文件名提取账号名称（如 4.env -> 4）
+    env_names = []
+    for env_path in [args.env1, args.env2, args.env3]:
+        env_name = Path(env_path).stem  # 获取不带扩展名的文件名
+        env_names.append(env_name)
+    
+    # 创建三个守护进程，使用格式：bot_环境文件名_activity.log
+    bots = [
+        DaemonBot(1, args.env1, log_dir / f'bot_{env_names[0]}_activity.log'),
+        DaemonBot(2, args.env2, log_dir / f'bot_{env_names[1]}_activity.log'),
+        DaemonBot(3, args.env3, log_dir / f'bot_{env_names[2]}_activity.log'),
+    ]
+    
+    # 信号处理
+    exiting = {'flag': False}
+    
+    def handle_sig(sig, frame):
+        if exiting['flag']:
+            return
+        exiting['flag'] = True
+        print('\n正在停止所有守护进程...')
+        for bot in bots:
+            bot.stop()
+    
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+    
+    print(f"对冲配置: {hedge_items}\n")
+    
+    # 启动所有守护进程
+    print("正在启动守护进程...")
+    for bot in bots:
+        # 打开日志文件
+        if bot.log_file:
+            bot.log_fd = open(bot.log_file, 'a', buffering=1)
+        
+        if not bot.start():
+            print("启动失败，退出")
+            return 1
+        time.sleep(0.5)
+    
+    print(f"\n所有守护进程已就绪，开始交易循环\n")
+    
+    # 多轮执行
+    for round_idx in range(args.rounds):
+        if exiting['flag']:
+            break
+        
+        print(f"{'='*60}")
+        print(f"[Round {round_idx+1}/{args.rounds}]")
+        print(f"{'='*60}")
+        
+        # 随机选择交易对和方向
+        item = random.choice(hedge_items)
+        ticker = str(item[0]).upper()
+        qty_main = Decimal(str(item[1]))
+        profit_pct = Decimal(str(item[2]))
+        # 读取杠杆（如果配置文件有第4个参数）
+        leverage = Decimal(str(item[3])) if len(item) > 3 else Decimal('20')
+        
+        direction_main = random.choice(['buy', 'sell'])
+        direction_hedge = 'sell' if direction_main == 'buy' else 'buy'
+        
+        # 数量分配
+        qty2 = (qty_main / Decimal('2')).quantize(Decimal('0.00000001'))
+        qty3 = (qty_main - qty2).quantize(Decimal('0.00000001'))
+        
+        print(f"交易对: {ticker}")
+        print(f"方向: Bot1={direction_main}, Bot2/3={direction_hedge}")
+        print(f"数量: Bot1={qty_main}, Bot2={qty2}, Bot3={qty3}")
+        print(f"杠杆: {leverage}x, 目标收益: {profit_pct}%\n")
+        
+        # 发送交易指令
+        print("发送交易指令:")
+        bots[0].send_trade_command(ticker, qty_main, direction_main, profit_pct, leverage)
+        time.sleep(0.2)
+        bots[1].send_trade_command(ticker, qty2, direction_hedge, profit_pct, leverage)
+        time.sleep(0.2)
+        bots[2].send_trade_command(ticker, qty3, direction_hedge, profit_pct, leverage)
+        
+        # 等待所有机器人完成
+        print("\n等待所有交易完成...")
+        
+        # 使用多线程并发等待，以便实时显示所有机器人的日志
+        import threading
+        results = [None, None, None]
+        
+        def wait_bot(idx):
+            results[idx] = bots[idx].wait_for_completion(timeout=7500)  # 稍长于 daemon 内部超时
+        
+        threads = []
+        for i in range(3):
+            t = threading.Thread(target=wait_bot, args=(i,))
+            t.start()
+            threads.append(t)
+        
+        for t in threads:
+            t.join()
+        
+        # 检查是否有超时错误
+        timeout_detected = False
+        for result in results:
+            if result and result.get('error') == 'TIMEOUT':
+                timeout_detected = True
+                bot_id = result.get('bot_id', '?')
+                print(f"\n❌ Bot{bot_id} 止盈止损等待超时，停止整个程序！\n")
+                break
+        
+        if timeout_detected:
+            print("正在停止所有守护进程...")
+            for bot in bots:
+                bot.stop()
+            print("程序已终止")
+            return 1  # 返回错误码
+        
+        success_count = sum(1 for r in results if r and r.get('success'))
+        print(f"\n本轮结果: {success_count}/3 成功\n")
+        
+        # 轮间等待
+        if round_idx < args.rounds - 1 and not exiting['flag']:
+            print(f"等待 {args.interval} 秒后进入下一轮...\n")
+            time.sleep(args.interval)
+    
+    # 清理
+    print("\n正在停止所有守护进程...")
+    for bot in bots:
+        bot.stop()
+    
+    print("退出")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+

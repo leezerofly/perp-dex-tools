@@ -49,6 +49,10 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--tp-sl-only', action='store_true',
+                        help='Only place one take-profit and one stop-loss limit order after fill')
+    parser.add_argument('--leverage', type=Decimal, default=Decimal(20),
+                        help='Leverage multiplier for calculating TP/SL prices (default: 20)')
 
     return parser.parse_args()
 
@@ -116,7 +120,10 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        # extended fields
+        tp_sl_only=args.tp_sl_only,
+        leverage=args.leverage
     )
 
     # Create and run the bot

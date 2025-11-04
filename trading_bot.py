@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Optional
 
 from exchanges import ExchangeFactory
+from exchanges.base import OrderResult
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
@@ -32,6 +33,10 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    # extended option: only place one TP and one SL as limit close orders after fill
+    tp_sl_only: bool = False
+    # leverage multiplier for calculating TP/SL prices
+    leverage: Decimal = Decimal('20')  # 默认杠杆 20x
 
     @property
     def close_order_side(self) -> str:
@@ -81,6 +86,10 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        
+        # TP/SL order tracking (for OCO logic)
+        self.tp_order_id = None
+        self.sl_order_id = None
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -216,6 +225,21 @@ class TradingBot:
                 except asyncio.TimeoutError:
                     pass
 
+            # Update order_result with latest status before handling
+            # This ensures we have the most current information
+            if self.config.exchange == "lighter" and self.exchange_client.current_order:
+                # Use WebSocket data if available
+                order_result = OrderResult(
+                    success=True,
+                    order_id=order_result.order_id,
+                    side=self.exchange_client.current_order.side,
+                    size=self.exchange_client.current_order.size,
+                    price=self.exchange_client.current_order.price,
+                    status=self.exchange_client.current_order.status,
+                    filled_size=self.exchange_client.current_order.filled_size
+                )
+                self.logger.log(f"[OPEN] 更新订单状态为 {order_result.status}", "DEBUG")
+            
             # Handle order result
             return await self._handle_order_result(order_result)
 
@@ -238,29 +262,256 @@ class TradingBot:
                 )
             else:
                 self.last_open_order_time = time.time()
-                # Place close order
-                close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
+                if getattr(self.config, 'tp_sl_only', False):
+                    # Place TP and SL limit close orders with proper order types
+                    close_side = self.config.close_order_side
+                    
+                    self.logger.log(f"[TP/SL] 开始设置止盈止损订单，成交价={filled_price}", "INFO")
+                    
+                    # 计算价格变动百分比：收益率 / 杠杆
+                    # 例如：5% 收益 / 20x 杠杆 = 0.25% 价格变动
+                    profit_pct = self.config.take_profit / Decimal(100)
+                    leverage = getattr(self.config, 'leverage', Decimal('20'))
+                    
+                    # 调试日志
+                    self.logger.log(f"[DEBUG] config.leverage 类型={type(self.config.leverage)}, 值={self.config.leverage}", "DEBUG")
+                    self.logger.log(f"[DEBUG] leverage 变量={leverage}, profit_pct={profit_pct}", "DEBUG")
+                    
+                    price_change_pct = profit_pct / leverage
+                    
+                    # 根据开仓方向计算止盈止损价格
+                    if self.config.direction == 'buy':
+                        # 开多：止盈价上涨，止损价下跌
+                        tp_price = filled_price * (1 + price_change_pct)
+                        sl_price = filled_price * (1 - price_change_pct)
+                    else:
+                        # 开空：止盈价下跌，止损价上涨
+                        tp_price = filled_price * (1 - price_change_pct)
+                        sl_price = filled_price * (1 + price_change_pct)
+
+                    # Round to tick size if available
+                    tick = self.config.tick_size or Decimal(0)
+                    def round_tick(px: Decimal) -> Decimal:
+                        if tick and tick > 0:
+                            q = (px / tick).quantize(Decimal('1'))
+                            return (q * tick).normalize()
+                        return px
+                    tp_price = round_tick(tp_price)
+                    sl_price = round_tick(sl_price)
+                    
+                    self.logger.log(f"[TP/SL] 开仓方向={self.config.direction}, 平仓方向={close_side}", "INFO")
+                    self.logger.log(f"[TP/SL] 杠杆={leverage}x, 目标收益={self.config.take_profit}%, 价格变动={price_change_pct*100:.4f}%", "INFO")
+                    self.logger.log(f"[TP/SL] 开仓价={filled_price}, TP={tp_price} ({((tp_price/filled_price-1)*100):.4f}%), SL={sl_price} ({((sl_price/filled_price-1)*100):.4f}%)", "INFO")
+
+                    # For Lighter exchange, use proper TP/SL order types
+                    if self.config.exchange == "lighter":
+                        self.logger.log(f"[TP/SL] 准备下止盈订单: {close_side} @ {tp_price} (trigger={tp_price})", "INFO")
+                        tp_res = await self.exchange_client.place_limit_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            tp_price,
+                            close_side,
+                            order_type='TAKE_PROFIT_LIMIT',
+                            trigger_price=tp_price,
+                            post_only=False  # 止盈止损订单不使用 POST_ONLY
+                        )
+                        if not tp_res.success:
+                            self.logger.log(f"[TP] Failed: {tp_res.error_message}", "ERROR")
+                            raise Exception(f"[TP] Failed: {tp_res.error_message}")
+                        
+                        self.logger.log(f"[TP] 止盈订单已下单 ✓ Order ID: {tp_res.order_id} (type={type(tp_res.order_id)})", "INFO")
+                        self.tp_order_id = tp_res.order_id  # 保存止盈订单ID
+                        
+                        # 等待 0.2 秒，确保下一个订单的 client_order_index 不同
+                        await asyncio.sleep(0.2)
+                        
+                        self.logger.log(f"[TP/SL] 准备下止损订单: {close_side} @ {sl_price} (trigger={sl_price})", "INFO")
+                        sl_res = await self.exchange_client.place_limit_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            sl_price,
+                            close_side,
+                            order_type='STOP_LOSS_LIMIT',
+                            trigger_price=sl_price,
+                            post_only=False  # 止盈止损订单不使用 POST_ONLY
+                        )
+                        if not sl_res.success:
+                            self.logger.log(f"[SL] Failed: {sl_res.error_message}", "ERROR")
+                            raise Exception(f"[SL] Failed: {sl_res.error_message}")
+                        
+                        self.logger.log(f"[SL] 止损订单已下单 ✓ Order ID: {sl_res.order_id} (type={type(sl_res.order_id)})", "INFO")
+                        self.sl_order_id = sl_res.order_id  # 保存止损订单ID
+                        
+                        await asyncio.sleep(1)
+                    else:
+                        # For other exchanges, fallback to regular limit orders
+                        tp_res = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            tp_price,
+                            close_side
+                        )
+                        if not tp_res.success:
+                            self.logger.log(f"[TP] Failed: {tp_res.error_message}", "ERROR")
+                            raise Exception(f"[TP] Failed: {tp_res.error_message}")
+
+                        sl_res = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            sl_price,
+                            close_side
+                        )
+                        if not sl_res.success:
+                            self.logger.log(f"[SL] Failed: {sl_res.error_message}", "ERROR")
+                            raise Exception(f"[SL] Failed: {sl_res.error_message}")
+                    
+                    return True
                 else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                    # Place single close order (legacy behavior)
+                    close_side = self.config.close_order_side
+                    if close_side == 'sell':
+                        close_price = filled_price * (1 + self.config.take_profit/100)
+                    else:
+                        close_price = filled_price * (1 - self.config.take_profit/100)
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
-                )
-                if self.config.exchange == "lighter":
-                    await asyncio.sleep(1)
+                    close_order_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        close_price,
+                        close_side
+                    )
+                    if self.config.exchange == "lighter":
+                        await asyncio.sleep(1)
 
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+                    if not close_order_result.success:
+                        self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                        raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
-                return True
+                    return True
 
         else:
+            # 订单未成交的处理
+            # 如果是 tp_sl_only 模式（对冲机器人），使用有限次数的取消重下
+            if getattr(self.config, 'tp_sl_only', False):
+                self.logger.log(f"[OPEN] [{order_id}] 订单未在规定时间内成交，开始重试逻辑", "WARNING")
+                
+                max_retries = 5  # 最多重试5次
+                retry_count = 0
+                max_price_diff_pct = Decimal('0.5')  # 允许0.5%的价差
+                
+                while retry_count < max_retries:
+                    retry_count += 1
+                    self.logger.log(f"[OPEN] 重试 {retry_count}/{max_retries}", "INFO")
+                    
+                    # 获取当前市场价格
+                    new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+                    
+                    # 检查价差是否在可接受范围内
+                    price_diff_pct = abs((new_order_price - order_result.price) / order_result.price * 100)
+                    self.logger.log(f"[OPEN] 原价={order_result.price}, 新价={new_order_price}, 价差={price_diff_pct:.4f}%", "INFO")
+                    
+                    if price_diff_pct > max_price_diff_pct:
+                        self.logger.log(f"[OPEN] 价差超过 {max_price_diff_pct}%，停止重试", "WARNING")
+                        break
+                    
+                    # 取消当前订单
+                    try:
+                        self.logger.log(f"[OPEN] 取消订单 {order_id}", "INFO")
+                        cancel_result = await self.exchange_client.cancel_order(order_id)
+                        if not cancel_result.success:
+                            self.logger.log(f"[OPEN] 取消订单失败: {cancel_result.error_message}", "WARNING")
+                            # 可能订单已经成交了，检查一下
+                            order_info = await self.exchange_client.get_order_info(order_id)
+                            if order_info and order_info.status == 'FILLED':
+                                self.logger.log(f"[OPEN] 订单已成交，返回成功", "INFO")
+                                # 递归调用自己，处理已成交的订单
+                                filled_result = OrderResult(
+                                    success=True,
+                                    order_id=order_id,
+                                    side=order_result.side,
+                                    size=order_result.size,
+                                    price=order_result.price,
+                                    status='FILLED'
+                                )
+                                return await self._handle_order_result(filled_result)
+                    except Exception as e:
+                        self.logger.log(f"[OPEN] 取消订单异常: {e}", "ERROR")
+                    
+                    # 等待一下，确保取消生效
+                    await asyncio.sleep(0.5)
+                    
+                    # 重新下单
+                    try:
+                        self.logger.log(f"[OPEN] 以新价格 {new_order_price} 重新下单", "INFO")
+                        new_order_result = await self.exchange_client.place_limit_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            new_order_price,
+                            self.config.direction
+                        )
+                        
+                        if not new_order_result.success:
+                            self.logger.log(f"[OPEN] 重新下单失败: {new_order_result.error_message}", "ERROR")
+                            continue
+                        
+                        order_id = new_order_result.order_id
+                        self.logger.log(f"[OPEN] 新订单已下单，ID={order_id}，等待成交...", "INFO")
+                        
+                        # 等待10秒看是否成交
+                        start_time = time.time()
+                        while time.time() - start_time < 10:
+                            if self.config.exchange == "lighter":
+                                if self.exchange_client.current_order and self.exchange_client.current_order.status == 'FILLED':
+                                    self.logger.log(f"[OPEN] 订单已成交 ✓", "INFO")
+                                    # 递归调用处理成交订单
+                                    filled_result = OrderResult(
+                                        success=True,
+                                        order_id=order_id,
+                                        side=self.config.direction,
+                                        size=self.config.quantity,
+                                        price=new_order_price,
+                                        status='FILLED'
+                                    )
+                                    return await self._handle_order_result(filled_result)
+                            else:
+                                order_info = await self.exchange_client.get_order_info(order_id)
+                                if order_info and order_info.status == 'FILLED':
+                                    self.logger.log(f"[OPEN] 订单已成交 ✓", "INFO")
+                                    filled_result = OrderResult(
+                                        success=True,
+                                        order_id=order_id,
+                                        side=self.config.direction,
+                                        size=self.config.quantity,
+                                        price=new_order_price,
+                                        status='FILLED'
+                                    )
+                                    return await self._handle_order_result(filled_result)
+                            
+                            await asyncio.sleep(0.5)
+                        
+                        # 10秒后仍未成交，继续下一次重试
+                        order_result = OrderResult(
+                            success=True,
+                            order_id=order_id,
+                            side=self.config.direction,
+                            size=self.config.quantity,
+                            price=new_order_price,
+                            status='OPEN'
+                        )
+                        
+                    except Exception as e:
+                        self.logger.log(f"[OPEN] 重新下单异常: {e}", "ERROR")
+                        continue
+                
+                # 重试失败，取消最后的订单并返回失败
+                self.logger.log(f"[OPEN] 重试 {max_retries} 次后仍未成交，取消订单并返回失败", "ERROR")
+                try:
+                    await self.exchange_client.cancel_order(order_id)
+                except:
+                    pass
+                return False
+            
+            # 普通模式：取消重下逻辑
             new_order_price = await self.exchange_client.get_order_price(self.config.direction)
 
             def should_wait(direction: str, new_order_price: Decimal, order_result_price: Decimal) -> bool:
@@ -523,6 +774,7 @@ class TradingBot:
 
                 # Filter close orders
                 self.active_close_orders = []
+                has_open_orders = False
                 for order in active_orders:
                     if order.side == self.config.close_order_side:
                         self.active_close_orders.append({
@@ -530,6 +782,21 @@ class TradingBot:
                             'price': order.price,
                             'size': order.size
                         })
+                    else:
+                        # Has open orders (not close orders)
+                        has_open_orders = True
+
+                # If using tp_sl_only mode and already have orders, don't place new ones
+                if getattr(self.config, 'tp_sl_only', False):
+                    if has_open_orders or len(self.active_close_orders) > 0:
+                        # Already have active orders, wait and check again
+                        await asyncio.sleep(5)
+                        continue
+                    elif self.last_close_orders > 0:
+                        # 已经完成一轮交易（开仓+平仓），退出
+                        self.logger.log("TP/SL only mode: One round completed, exiting", "INFO")
+                        await self.graceful_shutdown("TP/SL only mode: One round completed")
+                        return
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()

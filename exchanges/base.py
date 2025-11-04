@@ -112,6 +112,12 @@ class BaseExchangeClient(ABC):
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract."""
         pass
+    
+    async def get_all_active_orders(self) -> List[OrderInfo]:
+        """Get all active orders across all markets (to be implemented by subclass if needed)."""
+        # Default implementation: returns empty list
+        # Subclasses should override this if they can fetch all orders efficiently
+        return []
 
     @abstractmethod
     async def get_account_positions(self) -> Decimal:

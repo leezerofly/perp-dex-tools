@@ -215,7 +215,9 @@ class LighterClient(BaseExchangeClient):
                 self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                 f"{filled_size} @ {price}", "INFO")
 
-            if order_data['client_order_index'] == self.current_order_client_id or order_type == 'OPEN':
+            # Only update current_order if the client_order_index matches
+            # This ensures we track the correct order we're waiting for
+            if order_data['client_order_index'] == self.current_order_client_id:
                 current_order = OrderInfo(
                     order_id=order_id,
                     side=side,
@@ -227,6 +229,7 @@ class LighterClient(BaseExchangeClient):
                     cancel_reason=''
                 )
                 self.current_order = current_order
+                self.logger.log(f"[WS] 匹配订单更新: client_index={order_data['client_order_index']}, order_id={order_id}, status={status}", "DEBUG")
 
             if status in ['FILLED', 'CANCELED']:
                 self.logger.log_transaction(order_id, side, filled_size, price, status)
@@ -257,19 +260,53 @@ class LighterClient(BaseExchangeClient):
             # For now, raise an error if client is not initialized
             raise ValueError("Lighter client not initialized. Call connect() first.")
 
+        # Reset current_order before submitting to avoid stale data
+        self.current_order = None
+        client_order_index = order_params['client_order_index']
+        self.current_order_client_id = client_order_index
+
         # Create order using official SDK
         create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
         if error is not None:
             return OrderResult(
-                success=False, order_id=str(order_params['client_order_index']),
+                success=False, order_id=str(client_order_index),
                 error_message=f"Order creation error: {error}")
 
         else:
-            return OrderResult(success=True, order_id=str(order_params['client_order_index']))
+            # Wait for WebSocket to return the real order_index
+            start_time = time.time()
+            real_order_id = None
+            
+            # Wait up to 5 seconds for WebSocket order update
+            while time.time() - start_time < 5:
+                await asyncio.sleep(0.1)
+                if (self.current_order is not None and 
+                    self.current_order_client_id == client_order_index):
+                    real_order_id = self.current_order.order_id
+                    self.logger.log(f"[ORDER] 成功获取真实订单 ID: {real_order_id} (client_index={client_order_index})", "DEBUG")
+                    break
+            
+            # If we got the real order ID from WebSocket, use it; otherwise use client_order_index
+            if real_order_id:
+                return OrderResult(success=True, order_id=str(real_order_id))
+            else:
+                self.logger.log(f"[WARNING] 未能从 WebSocket 获取真实订单 ID，使用 client_order_index: {client_order_index}", "WARNING")
+                return OrderResult(success=True, order_id=str(client_order_index))
 
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                side: str) -> OrderResult:
-        """Place a post only order with Lighter using official SDK."""
+                                side: str, order_type: str = 'LIMIT', trigger_price: Decimal = Decimal('0'),
+                                post_only: bool = False) -> OrderResult:
+        """Place a limit order with Lighter using official SDK.
+        
+        Args:
+            contract_id: Market contract ID
+            quantity: Order quantity
+            price: Limit price
+            side: 'buy' or 'sell'
+            order_type: 'LIMIT', 'TAKE_PROFIT_LIMIT', or 'STOP_LOSS_LIMIT'
+            trigger_price: Trigger price for TP/SL orders
+            post_only: If True, order will only be placed as maker (default: True)
+        """
         # Ensure client is initialized
         if self.lighter_client is None:
             await self._initialize_lighter_client()
@@ -284,8 +321,24 @@ class LighterClient(BaseExchangeClient):
 
         # Generate unique client order index
         client_order_index = int(time.time() * 1000) % 1000000  # Simple unique ID
-        self.current_order_client_id = client_order_index
+        # Note: current_order_client_id will be set in _submit_order_with_retry
 
+        # Determine order type constant
+        if order_type == 'TAKE_PROFIT_LIMIT':
+            ot = self.lighter_client.ORDER_TYPE_TAKE_PROFIT_LIMIT
+        elif order_type == 'STOP_LOSS_LIMIT':
+            ot = self.lighter_client.ORDER_TYPE_STOP_LOSS_LIMIT
+        else:
+            ot = self.lighter_client.ORDER_TYPE_LIMIT
+
+        # Determine time_in_force based on post_only setting
+        if post_only:
+            tif = self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY
+            self.logger.log(f"[ORDER] 使用 POST_ONLY 模式（仅挂单，不吃单）", "DEBUG")
+        else:
+            tif = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+            self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式", "DEBUG")
+        
         # Create order parameters
         order_params = {
             'market_index': self.config.contract_id,
@@ -293,10 +346,10 @@ class LighterClient(BaseExchangeClient):
             'base_amount': int(quantity * self.base_amount_multiplier),
             'price': int(price * self.price_multiplier),
             'is_ask': is_ask,
-            'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
-            'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            'order_type': ot,
+            'time_in_force': tif,
             'reduce_only': False,
-            'trigger_price': 0,
+            'trigger_price': int(trigger_price * self.price_multiplier) if trigger_price > 0 else 0,
         }
 
         order_result = await self._submit_order_with_retry(order_params)
@@ -305,8 +358,7 @@ class LighterClient(BaseExchangeClient):
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with Lighter using official SDK."""
 
-        self.current_order = None
-        self.current_order_client_id = None
+        # Note: current_order and current_order_client_id will be reset in _submit_order_with_retry
         order_price = await self.get_order_price(direction)
 
         order_price = self.round_to_tick(order_price)
@@ -314,22 +366,48 @@ class LighterClient(BaseExchangeClient):
         if not order_result.success:
             raise Exception(f"[OPEN] Error placing order: {order_result.error_message}")
 
+        # Wait for order to be filled (up to 10 seconds)
         start_time = time.time()
         order_status = 'OPEN'
+        max_wait = 10
+        
+        self.logger.log(f"[OPEN] 等待订单成交，订单ID={order_result.order_id}", "DEBUG")
+        
+        while time.time() - start_time < max_wait:
+            # Check if order is filled via WebSocket
+            if self.current_order and self.current_order.status == 'FILLED':
+                order_status = 'FILLED'
+                self.logger.log(f"[OPEN] WebSocket 检测到订单已成交", "DEBUG")
+                break
+            
+            # Also check via REST API
+            order_info = await self.get_order_info(order_result.order_id)
+            if order_info and order_info.status == 'FILLED':
+                order_status = 'FILLED'
+                self.logger.log(f"[OPEN] REST API 检测到订单已成交", "DEBUG")
+                break
+            
+            await asyncio.sleep(0.5)
+        
+        # If still not filled after 10 seconds, get final status
+        if order_status != 'FILLED':
+            order_info = await self.get_order_info(order_result.order_id)
+            if order_info:
+                order_status = order_info.status
+                self.logger.log(f"[OPEN] 10秒后订单状态={order_status}", "WARNING")
+            else:
+                order_status = self.current_order.status if self.current_order else 'OPEN'
+                self.logger.log(f"[OPEN] 无法获取订单状态，使用默认状态={order_status}", "WARNING")
 
-        # While waiting for order to be filled
-        while time.time() - start_time < 10 and order_status != 'FILLED':
-            await asyncio.sleep(0.1)
-            if self.current_order is not None:
-                order_status = self.current_order.status
-
+        self.logger.log(f"[OPEN] 最终状态={order_status}，将传递给 _handle_order_result", "DEBUG")
+        
         return OrderResult(
             success=True,
-            order_id=self.current_order.order_id,
+            order_id=order_result.order_id,  # Use the order_id from place_limit_order result
             side=direction,
             size=quantity,
             price=order_price,
-            status=self.current_order.status
+            status=order_status
         )
 
     async def _get_active_close_orders(self, contract_id: str) -> int:
@@ -485,6 +563,34 @@ class LighterClient(BaseExchangeClient):
                 ))
 
         return contract_orders
+    
+    async def get_all_active_orders(self) -> List[OrderInfo]:
+        """Get all active orders/positions across all markets."""
+        try:
+            positions = await self._fetch_positions_with_retry()
+            
+            all_positions = []
+            # Check all positions across all markets
+            for pos in positions:
+                # position 对象有 market_id 和 position 字段
+                position_amount = abs(float(getattr(pos, 'position', 0)))
+                if position_amount > 0:
+                    market_id = getattr(pos, 'market_id', 'unknown')
+                    # Return position info to indicate there are active positions
+                    all_positions.append(OrderInfo(
+                        order_id=f"position_{market_id}",
+                        side="long" if float(getattr(pos, 'position', 0)) > 0 else "short",
+                        size=Decimal(position_amount),
+                        price=Decimal('0'),
+                        status="POSITION",
+                        filled_size=Decimal('0'),
+                        remaining_size=Decimal('0')
+                    ))
+            
+            return all_positions
+        except Exception as e:
+            self.logger.log(f"Error checking all active orders: {e}", "ERROR")
+            return []
 
     @query_retry(reraise=True)
     async def _fetch_positions_with_retry(self) -> List[Dict[str, Any]]:
