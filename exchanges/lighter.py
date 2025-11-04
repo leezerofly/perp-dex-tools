@@ -60,6 +60,12 @@ class LighterClient(BaseExchangeClient):
         self.current_order_client_id = None
         self.current_order = None
 
+        # WebSocket-based order tracking (NEW: for event-driven order monitoring)
+        self.active_orders_dict = {}  # {order_id: OrderInfo}
+        self.order_update_event = asyncio.Event()  # Triggered on any order update
+        self.ws_connected = False  # Track WebSocket connection status
+        self.last_ws_update_time = 0  # Last time we received a WS update
+
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
         required_env_vars = ['API_KEY_PRIVATE_KEY', 'LIGHTER_ACCOUNT_INDEX', 'LIGHTER_API_KEY_INDEX']
@@ -147,6 +153,10 @@ class LighterClient(BaseExchangeClient):
             asyncio.create_task(self.ws_manager.connect())
             # Wait a moment for connection to establish
             await asyncio.sleep(2)
+            
+            # Mark WebSocket as connected
+            self.ws_connected = True
+            self.last_ws_update_time = time.time()
 
         except Exception as e:
             self.logger.log(f"Error connecting to Lighter: {e}", "ERROR")
@@ -175,6 +185,9 @@ class LighterClient(BaseExchangeClient):
 
     def _handle_websocket_order_update(self, order_data_list: List[Dict[str, Any]]):
         """Handle order updates from WebSocket."""
+        # Update last WS update time
+        self.last_ws_update_time = time.time()
+        
         for order_data in order_data_list:
             if order_data['market_index'] != self.config.contract_id:
                 continue
@@ -185,18 +198,57 @@ class LighterClient(BaseExchangeClient):
             else:
                 order_type = "OPEN"
 
-            order_id = order_data['order_index']
+            order_id = str(order_data['order_index'])
             status = order_data['status'].upper()
             filled_size = Decimal(order_data['filled_base_amount'])
             size = Decimal(order_data['initial_base_amount'])
             price = Decimal(order_data['price'])
             remaining_size = Decimal(order_data['remaining_base_amount'])
 
+            # === NEW: Update active_orders_dict for event-driven monitoring ===
+            # Do this BEFORE the continue check so events are always triggered
+            order_state_changed = False
+            
+            if status in ['FILLED', 'CANCELED', 'CANCELLED']:
+                # Remove completed orders
+                if order_id in self.active_orders_dict:
+                    del self.active_orders_dict[order_id]
+                    order_state_changed = True  # Order completed - trigger event
+            else:
+                # Check if this is a real update
+                if order_id in self.active_orders_dict:
+                    old_order = self.active_orders_dict[order_id]
+                    # Only trigger if status or filled_size changed
+                    if (old_order.status != status or 
+                        old_order.filled_size != filled_size):
+                        order_state_changed = True
+                else:
+                    # New order - always trigger
+                    order_state_changed = True
+                
+                # Update or add active order
+                self.active_orders_dict[order_id] = OrderInfo(
+                    order_id=order_id,
+                    side=side,
+                    size=remaining_size,
+                    price=price,
+                    status=status,
+                    filled_size=filled_size,
+                    remaining_size=remaining_size
+                )
+            
+            # Trigger event to notify waiting tasks (BEFORE continue check!)
+            if order_state_changed:
+                self.logger.log(f"⚡ 订单状态变化，触发WebSocket事件通知", "DEBUG")
+                self.order_update_event.set()
+                self.order_update_event.clear()  # Reset for next update
+
+            # === Original cache logic (keep for backward compatibility) ===
             if order_id in self.orders_cache.keys():
                 if (self.orders_cache[order_id]['status'] == 'OPEN' and
                         status == 'OPEN' and
                         filled_size == self.orders_cache[order_id]['filled_size']):
-                    continue
+                    continue  # Skip logging for unchanged orders
                 elif status in ['FILLED', 'CANCELED']:
                     del self.orders_cache[order_id]
                 else:
@@ -539,7 +591,32 @@ class LighterClient(BaseExchangeClient):
         return orders_response.orders
 
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
-        """Get active orders for a contract using official SDK."""
+        """Get active orders for a contract.
+        
+        NEW BEHAVIOR: 
+        - Prefer WebSocket data if connected and recently updated
+        - Fallback to REST API if WebSocket is stale or disconnected
+        """
+        # Check if WebSocket is healthy (updated within last 30 seconds)
+        ws_is_healthy = (
+            self.ws_connected and 
+            self.last_ws_update_time > 0 and
+            (time.time() - self.last_ws_update_time) < 30
+        )
+        
+        # If WebSocket is healthy, use in-memory data
+        if ws_is_healthy and len(self.active_orders_dict) >= 0:
+            # Return active orders from WebSocket updates
+            orders = list(self.active_orders_dict.values())
+            # Log WebSocket usage (DEBUG level to reduce noise)
+            # Note: Order updates via WebSocket are logged in _handle_websocket_order_update
+            if self.last_ws_update_time > 0:
+                ws_age = int(time.time() - self.last_ws_update_time)
+                self.logger.log(f"📡 Using WebSocket data ({len(orders)} orders, WS更新于 {ws_age}秒前)", "DEBUG")
+            return orders
+        
+        # Fallback to REST API
+        self.logger.log("🔄 WebSocket stale or disconnected, using REST API", "WARNING")
         order_list = await self._fetch_orders_with_retry()
 
         # Filter orders for the specific market
@@ -552,7 +629,7 @@ class LighterClient(BaseExchangeClient):
 
             # Only include orders with remaining size > 0
             if size > 0:
-                contract_orders.append(OrderInfo(
+                order_info = OrderInfo(
                     order_id=str(order.order_index),
                     side=side,
                     size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
@@ -560,9 +637,25 @@ class LighterClient(BaseExchangeClient):
                     status=order.status.upper(),
                     filled_size=Decimal(order.filled_base_amount),
                     remaining_size=Decimal(order.remaining_base_amount)
-                ))
+                )
+                contract_orders.append(order_info)
+                
+                # Sync to active_orders_dict
+                self.active_orders_dict[order_info.order_id] = order_info
 
         return contract_orders
+    
+    async def wait_for_order_update(self, timeout: float = 60) -> bool:
+        """Wait for any order update from WebSocket.
+        
+        Returns:
+            True if update received, False if timeout
+        """
+        try:
+            await asyncio.wait_for(self.order_update_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
     
     async def get_all_active_orders(self) -> List[OrderInfo]:
         """Get all active orders/positions across all markets."""

@@ -333,10 +333,11 @@ def main():
         success_count = sum(1 for r in results if r and r.get('success'))
         print(f"\n本轮结果: {success_count}/3 成功\n")
         
-        # 轮间等待
+        # 轮间等待（随机30-60秒）
         if round_idx < args.rounds - 1 and not exiting['flag']:
-            print(f"等待 {args.interval} 秒后进入下一轮...\n")
-            time.sleep(args.interval)
+            wait_time = random.randint(30, 60)  # 随机30-60秒
+            print(f"等待 {wait_time} 秒后进入下一轮...\n")
+            time.sleep(wait_time)
     
     # 清理
     print("\n正在停止所有守护进程...")

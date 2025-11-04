@@ -63,8 +63,15 @@ async def execute_single_trade(config: TradingConfig):
         
         check_count = 0
         tp_sl_orders_exist = True  # 标记止盈止损订单是否还存在
+        last_status_log_time = start_time  # 上次输出状态的时间
+        initial_check_done = False  # 标记是否完成初始检查
         
         while asyncio.get_event_loop().time() - start_time < max_wait:
+            # === NEW: Wait for order update event instead of fixed sleep ===
+            # This dramatically reduces API calls while maintaining real-time responsiveness
+            update_received = await bot.exchange_client.wait_for_order_update(timeout=60)
+            
+            # Get active orders (will use WebSocket data, very cheap)
             active_orders = await bot.exchange_client.get_active_orders(config.contract_id)
             
             if len(active_orders) == 0:
@@ -129,13 +136,29 @@ async def execute_single_trade(config: TradingConfig):
                     # 不要设置 tp_sl_orders_exist = False，让它继续检查，直到所有订单都完成
                     # tp_sl_orders_exist = False
             
-            # 每60秒输出一次状态
-            check_count += 1
-            if check_count % 2 == 0:  # 检查间隔30秒，每2次输出一次
-                elapsed = int(asyncio.get_event_loop().time() - start_time)
-                log_output(f"仍有 {len(active_orders)} 个活跃订单... (已等待 {elapsed}s / {max_wait}s)")
+            # 状态日志输出逻辑（优化：减少日志噪音）
+            current_time = asyncio.get_event_loop().time()
+            elapsed = int(current_time - start_time)
             
-            await asyncio.sleep(30)  # 每30秒检查一次（优化：减少API调用）
+            # 初始确认（前60秒内）
+            if not initial_check_done and elapsed >= 5:
+                log_output(f"✓ 已确认 {len(active_orders)} 个订单处于挂单状态，等待市场成交...")
+                initial_check_done = True
+                last_status_log_time = current_time
+            
+            # 有变化时立即输出
+            elif update_received:
+                log_output(f"⚡ WebSocket事件触发！订单状态有变化 (已等待 {elapsed}s)")
+                last_status_log_time = current_time
+            
+            # 无变化时：每10分钟输出一次心跳（而非每120秒）
+            elif current_time - last_status_log_time >= 600:  # 600秒 = 10分钟
+                log_output(f"💤 仍有 {len(active_orders)} 个订单挂单中... (已等待 {elapsed}s / {max_wait}s)")
+                log_output(f"   WebSocket保持连接，订单成交时将自动触发（无需轮询API）")
+                last_status_log_time = current_time
+            
+            # No more fixed sleep! Event-driven approach
+            # Will wait for next order update or 60s timeout in next iteration
         else:
             # 超时，返回失败并标记需要停止整个程序
             elapsed = int(asyncio.get_event_loop().time() - start_time)
