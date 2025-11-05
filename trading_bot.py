@@ -313,7 +313,8 @@ class TradingBot:
                             close_side,
                             order_type='TAKE_PROFIT_LIMIT',
                             trigger_price=tp_price,
-                            post_only=False  # 止盈止损订单不使用 POST_ONLY
+                            post_only=False,  # 止盈止损订单不使用 POST_ONLY
+                            reduce_only=True  # ✅ 仅减仓，防止误开反向仓位
                         )
                         if not tp_res.success:
                             self.logger.log(f"[TP] Failed: {tp_res.error_message}", "ERROR")
@@ -333,7 +334,8 @@ class TradingBot:
                             close_side,
                             order_type='STOP_LOSS_LIMIT',
                             trigger_price=sl_price,
-                            post_only=False  # 止盈止损订单不使用 POST_ONLY
+                            post_only=False,  # 止盈止损订单不使用 POST_ONLY
+                            reduce_only=True  # ✅ 仅减仓，防止误开反向仓位
                         )
                         if not sl_res.success:
                             self.logger.log(f"[SL] Failed: {sl_res.error_message}", "ERROR")
@@ -397,21 +399,37 @@ class TradingBot:
                 
                 max_retries = 5  # 最多重试5次
                 retry_count = 0
-                max_price_diff_pct = Decimal('0.5')  # 允许0.5%的价差
+                max_price_adjustment_pct = Decimal('0.5')  # 总最大调整幅度
+                price_step_pct = Decimal('0.1')  # 每次重试调整0.1%
+                initial_price = order_result.price  # 保存初始价格
                 
                 while retry_count < max_retries:
                     retry_count += 1
                     self.logger.log(f"[OPEN] 重试 {retry_count}/{max_retries}", "INFO")
                     
-                    # 获取当前市场价格
-                    new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+                    # 根据重试次数逐步调整价格
+                    # 买单：价格逐步提高（更容易成交）
+                    # 卖单：价格逐步降低（更容易成交）
+                    adjustment_pct = price_step_pct * retry_count
+                    if self.config.direction == 'buy':
+                        new_order_price = initial_price * (Decimal('1') + adjustment_pct / Decimal('100'))
+                    else:
+                        new_order_price = initial_price * (Decimal('1') - adjustment_pct / Decimal('100'))
                     
-                    # 检查价差是否在可接受范围内
-                    price_diff_pct = abs((new_order_price - order_result.price) / order_result.price * 100)
-                    self.logger.log(f"[OPEN] 原价={order_result.price}, 新价={new_order_price}, 价差={price_diff_pct:.4f}%", "INFO")
+                    # 对齐到tick size
+                    new_order_price = self.exchange_client.round_to_tick(new_order_price)
                     
-                    if price_diff_pct > max_price_diff_pct:
-                        self.logger.log(f"[OPEN] 价差超过 {max_price_diff_pct}%，停止重试", "WARNING")
+                    # 计算总调整幅度
+                    total_adjustment_pct = abs((new_order_price - initial_price) / initial_price * 100)
+                    self.logger.log(
+                        f"[OPEN] 原价={initial_price}, 新价={new_order_price}, "
+                        f"调整={adjustment_pct:.2f}% (总计{total_adjustment_pct:.4f}%)",
+                        "INFO"
+                    )
+                    
+                    # 检查是否超过最大调整幅度
+                    if total_adjustment_pct > max_price_adjustment_pct:
+                        self.logger.log(f"[OPEN] 价格调整超过 {max_price_adjustment_pct}%，停止重试", "WARNING")
                         break
                     
                     # 取消当前订单

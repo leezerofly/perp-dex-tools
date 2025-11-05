@@ -154,7 +154,6 @@ async def execute_single_trade(config: TradingConfig):
             # 无变化时：每10分钟输出一次心跳（而非每120秒）
             elif current_time - last_status_log_time >= 600:  # 600秒 = 10分钟
                 log_output(f"💤 仍有 {len(active_orders)} 个订单挂单中... (已等待 {elapsed}s / {max_wait}s)")
-                log_output(f"   WebSocket保持连接，订单成交时将自动触发（无需轮询API）")
                 last_status_log_time = current_time
             
             # No more fixed sleep! Event-driven approach
