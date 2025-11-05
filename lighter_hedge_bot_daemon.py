@@ -32,10 +32,14 @@ class Colors:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Lighter 对冲 - 守护进程版本')
-    parser.add_argument('--env1', required=True, help='账号1 .env 路径')
-    parser.add_argument('--env2', required=True, help='账号2 .env 路径')
-    parser.add_argument('--env3', required=True, help='账号3 .env 路径')
+    
+    # 支持两种模式：组名模式 或 传统模式
+    parser.add_argument('--group', help='组名（从 hedge_config_multi.json 读取配置）')
+    parser.add_argument('--env1', help='账号1 .env 路径')
+    parser.add_argument('--env2', help='账号2 .env 路径')
+    parser.add_argument('--env3', help='账号3 .env 路径')
     parser.add_argument('--config', default='hedge_config.json', help='对冲配置文件 格式: [["ticker", quantity, profit_pct, leverage], ...]')
+    parser.add_argument('--multi-config', default='hedge_config_multi.json', help='多组配置文件路径')
     parser.add_argument('--log-dir', default='./logs', help='日志输出目录')
     parser.add_argument('--rounds', type=int, default=2000, help='运行轮数')
     parser.add_argument('--interval', type=int, default=60, help='多轮之间的间隔秒数')
@@ -50,6 +54,38 @@ def load_hedge_config(config_file: str) -> List[List]:
     if not isinstance(data, list) or not data:
         raise ValueError('配置内容不合法或为空')
     return data
+
+
+def load_group_config(multi_config_file: str, group_name: str):
+    """从多组配置文件加载指定组的配置"""
+    cfg_path = Path(multi_config_file)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {multi_config_file}")
+    
+    data = json.loads(cfg_path.read_text(encoding='utf-8'))
+    
+    # 查找指定组
+    for group in data.get('groups', []):
+        if group.get('name') == group_name:
+            if not group.get('enabled', True):
+                raise ValueError(f"组 {group_name} 已被禁用")
+            
+            # 提取配置
+            accounts = group.get('accounts', {})
+            if len(accounts) != 3:
+                raise ValueError(f"组 {group_name} 必须配置3个账号")
+            
+            # 返回配置字典
+            return {
+                'env1': list(accounts.values())[0],
+                'env2': list(accounts.values())[1],
+                'env3': list(accounts.values())[2],
+                'trading_pairs': group.get('trading_pairs', []),
+                'rounds': group.get('rounds', 2000),
+                'log_prefix': group.get('log_prefix', group_name.lower())
+            }
+    
+    raise ValueError(f"未找到组: {group_name}")
 
 
 class DaemonBot:
@@ -202,8 +238,36 @@ class DaemonBot:
 def main():
     args = parse_arguments()
     
-    # 读取配置
-    hedge_items = load_hedge_config(args.config)
+    # 判断使用哪种模式
+    if args.group:
+        # 组名模式：从 hedge_config_multi.json 加载
+        try:
+            group_config = load_group_config(args.multi_config, args.group)
+            args.env1 = group_config['env1']
+            args.env2 = group_config['env2']
+            args.env3 = group_config['env3']
+            args.rounds = group_config['rounds']
+            
+            # 使用交易对配置（从 group config 直接读取）
+            hedge_items = group_config['trading_pairs']
+            
+            print(f"{Colors.BOLD}🚀 启动组: {args.group}{Colors.RESET}")
+            print(f"📁 账号: {args.env1}, {args.env2}, {args.env3}")
+            print(f"📊 交易对数量: {len(hedge_items)}")
+            print(f"🔄 运行轮数: {args.rounds}")
+            print()
+            
+        except Exception as e:
+            print(f"❌ 加载组配置失败: {e}")
+            return 1
+    else:
+        # 传统模式：需要指定 env1, env2, env3
+        if not all([args.env1, args.env2, args.env3]):
+            print("❌ 错误: 必须指定 --group 或同时指定 --env1、--env2、--env3")
+            return 1
+        
+        # 读取配置
+        hedge_items = load_hedge_config(args.config)
     
     # 验证 env 文件
     for p in [args.env1, args.env2, args.env3]:
