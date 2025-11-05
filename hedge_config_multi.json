@@ -1,7 +1,7 @@
 {
   "groups": [
     {
-        "name": "Group-A",
+        "name": "A",
         "enabled": true,
         "accounts": {
             "bot1": "envs/1.env",
@@ -17,7 +17,7 @@
         "log_prefix": "groupA"
     },
     {
-        "name": "Group-B",
+        "name": "B",
         "enabled": true,
         "accounts": {
             "bot1": "envs/4.env",
@@ -32,22 +32,17 @@
         "log_prefix": "groupB"
     },
     {
-        "name": "Group-C",
+        "name": "C",
         "enabled": false,
         "accounts": {
             "bot1": "envs/7.env",
             "bot2": "envs/8.env",
             "bot3": "envs/9.env"
         },
-        "proxy": {
-            "url": "http://another-proxy.com:3128",
-            "username": "user2",
-            "password": "pass2"
-        },
         "trading_pairs": [
             ["SOL", 1, 3, 6]
         ],
-        "rounds": 1000,
+        "rounds": 2000,
         "log_prefix": "groupC"
         }
     ],

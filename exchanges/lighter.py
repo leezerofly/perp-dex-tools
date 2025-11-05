@@ -347,7 +347,7 @@ class LighterClient(BaseExchangeClient):
 
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
                                 side: str, order_type: str = 'LIMIT', trigger_price: Decimal = Decimal('0'),
-                                post_only: bool = False) -> OrderResult:
+                                post_only: bool = False, reduce_only: bool = False) -> OrderResult:
         """Place a limit order with Lighter using official SDK.
         
         Args:
@@ -358,6 +358,7 @@ class LighterClient(BaseExchangeClient):
             order_type: 'LIMIT', 'TAKE_PROFIT_LIMIT', or 'STOP_LOSS_LIMIT'
             trigger_price: Trigger price for TP/SL orders
             post_only: If True, order will only be placed as maker (default: True)
+            reduce_only: If True, order will only reduce position (default: False)
         """
         # Ensure client is initialized
         if self.lighter_client is None:
@@ -400,7 +401,7 @@ class LighterClient(BaseExchangeClient):
             'is_ask': is_ask,
             'order_type': ot,
             'time_in_force': tif,
-            'reduce_only': False,
+            'reduce_only': reduce_only,
             'trigger_price': int(trigger_price * self.price_multiplier) if trigger_price > 0 else 0,
         }
 
@@ -540,8 +541,13 @@ class LighterClient(BaseExchangeClient):
             # Get account orders
             account_data = await account_api.account(by="index", value=str(self.account_index))
 
+            # Check if we have account data
+            if not account_data or not account_data.accounts:
+                self.logger.log("No account data available", "WARNING")
+                return None
+
             # Look for the specific order in account positions
-            for position in account_data.positions:
+            for position in account_data.accounts[0].positions:
                 if position.symbol == self.config.ticker:
                     position_amt = abs(float(position.position))
                     if position_amt > 0.001:  # Only include significant positions
