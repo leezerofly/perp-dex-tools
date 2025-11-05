@@ -8,10 +8,9 @@
             "bot2": "envs/2.env",
             "bot3": "envs/3.env"
         },
-        "proxy": null,
         "trading_pairs": [
             ["MET", 100, 5, 5],
-            ["PAXG", 0.05, 1.5, 8]
+            ["PAXG", 0.05, 1, 8]
         ],
         "rounds": 2000,
         "log_prefix": "groupA"
@@ -25,8 +24,8 @@
             "bot3": "envs/6.env"
         },
         "trading_pairs": [
-            ["MET", 100, 5, 5],
-            ["PAXG", 0.05, 1.5, 8]
+            ["MET", 100, 1, 5],
+            ["PAXG", 0.05, 1, 8]
         ],
         "rounds": 2000,
         "log_prefix": "groupB"
