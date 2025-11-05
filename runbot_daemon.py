@@ -61,8 +61,6 @@ async def execute_single_trade(config: TradingConfig):
         max_wait = 7200  # 最多等待2小时 (7200秒)
         start_time = asyncio.get_event_loop().time()
         
-        check_count = 0
-        tp_sl_orders_exist = True  # 标记止盈止损订单是否还存在
         last_status_log_time = start_time  # 上次输出状态的时间
         initial_check_done = False  # 标记是否完成初始检查
         
@@ -78,63 +76,8 @@ async def execute_single_trade(config: TradingConfig):
                 log_output("所有订单已完成 ✓")
                 break
             
-            # OCO 逻辑：检查止盈或止损订单是否触发
-            if tp_sl_orders_exist and bot.tp_order_id and bot.sl_order_id:
-                # 调试：显示保存的订单 ID
-                # log_output(f"[OCO调试] 保存的 TP_ID={bot.tp_order_id}, SL_ID={bot.sl_order_id}")
-                # log_output(f"[OCO调试] 活跃订单列表: {[o.order_id for o in active_orders]}")
-                
-                # 查找止盈止损订单
-                tp_order = None
-                sl_order = None
-                other_orders = []
-                
-                for o in active_orders:
-                    if o.order_id == str(bot.tp_order_id):
-                        tp_order = o
-                    elif o.order_id == str(bot.sl_order_id):
-                        sl_order = o
-                    else:
-                        other_orders.append(o)
-                
-                tp_exists = tp_order is not None
-                sl_exists = sl_order is not None
-                
-                # log_output(f"[OCO检查] TP存在={tp_exists}, SL存在={sl_exists}, 其他订单={len(other_orders)}")
-                
-                # 如果止盈订单不存在了（被触发），取消止损订单
-                if not tp_exists and sl_exists:
-                    log_output(f"✓ 止盈订单已触发，取消止损订单 {bot.sl_order_id}")
-                    try:
-                        cancel_result = await bot.exchange_client.cancel_order(str(bot.sl_order_id))
-                        if cancel_result.success:
-                            log_output("✓ 止损订单已取消成功")
-                        else:
-                            log_output(f"✗ 取消止损订单失败: {cancel_result.error_message}")
-                        tp_sl_orders_exist = False
-                    except Exception as e:
-                        log_output(f"✗ 取消止损订单异常: {e}")
-                        tp_sl_orders_exist = False
-                
-                # 如果止损订单不存在了（被触发），取消止盈订单
-                elif not sl_exists and tp_exists:
-                    log_output(f"✗ 止损订单已触发，取消止盈订单 {bot.tp_order_id}")
-                    try:
-                        cancel_result = await bot.exchange_client.cancel_order(str(bot.tp_order_id))
-                        if cancel_result.success:
-                            log_output("✓ 止盈订单已取消成功")
-                        else:
-                            log_output(f"✗ 取消止盈订单失败: {cancel_result.error_message}")
-                        tp_sl_orders_exist = False
-                    except Exception as e:
-                        log_output(f"✗ 取消止盈订单异常: {e}")
-                        tp_sl_orders_exist = False
-                
-                # 如果两个订单都不存在了，说明都完成了（或者被其他原因取消）
-                elif not tp_exists and not sl_exists:
-                    log_output("止盈止损订单都已不存在")
-                    # 不要设置 tp_sl_orders_exist = False，让它继续检查，直到所有订单都完成
-                    # tp_sl_orders_exist = False
+            # 注意：由于订单设置了 reduce_only=True，当其中一个止盈/止损订单触发并平仓后，
+            # 另一个订单会因为没有仓位而被交易所自动取消，不需要手动处理 OCO 逻辑
             
             # 状态日志输出逻辑（优化：减少日志噪音）
             current_time = asyncio.get_event_loop().time()

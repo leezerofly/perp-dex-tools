@@ -87,7 +87,8 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
         
-        # TP/SL order tracking (for OCO logic)
+        # TP/SL order tracking (for logging and debugging)
+        # Note: OCO logic is handled automatically by reduce_only flag
         self.tp_order_id = None
         self.sl_order_id = None
 
