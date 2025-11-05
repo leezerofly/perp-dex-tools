@@ -47,18 +47,12 @@ async def execute_single_trade(config: TradingConfig):
         
         log_output("开仓成功，止盈止损订单已设置 ✓")
         
-        # 检查止盈止损订单ID是否已设置
-        if bot.tp_order_id and bot.sl_order_id:
-            log_output(f"[验证] TP_ID={bot.tp_order_id}, SL_ID={bot.sl_order_id} 已保存")
-        else:
-            log_output(f"[警告] 止盈止损订单ID未正确保存！TP_ID={bot.tp_order_id}, SL_ID={bot.sl_order_id}")
-        
         # 短暂等待，确保止盈止损订单已经生效
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.2)
         
         # 等待止盈/止损
         log_output("等待止盈或止损触发...")
-        max_wait = 7200  # 最多等待2小时 (7200秒)
+        max_wait = 7200 * 4 # 最多等待8小时 (7200秒 * 4)
         start_time = asyncio.get_event_loop().time()
         
         last_status_log_time = start_time  # 上次输出状态的时间

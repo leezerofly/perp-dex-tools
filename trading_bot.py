@@ -228,18 +228,36 @@ class TradingBot:
 
             # Update order_result with latest status before handling
             # This ensures we have the most current information
-            if self.config.exchange == "lighter" and self.exchange_client.current_order:
-                # Use WebSocket data if available
-                order_result = OrderResult(
-                    success=True,
-                    order_id=order_result.order_id,
-                    side=self.exchange_client.current_order.side,
-                    size=self.exchange_client.current_order.size,
-                    price=self.exchange_client.current_order.price,
-                    status=self.exchange_client.current_order.status,
-                    filled_size=self.exchange_client.current_order.filled_size
-                )
-                self.logger.log(f"[OPEN] 更新订单状态为 {order_result.status}", "DEBUG")
+            if self.config.exchange == "lighter":
+                # 优先使用WebSocket数据（如果启用且可用）
+                if (hasattr(self.exchange_client, 'use_websocket') and 
+                    self.exchange_client.use_websocket and 
+                    self.exchange_client.current_order):
+                    # Use WebSocket data if available
+                    order_result = OrderResult(
+                        success=True,
+                        order_id=order_result.order_id,
+                        side=self.exchange_client.current_order.side,
+                        size=self.exchange_client.current_order.size,
+                        price=self.exchange_client.current_order.price,
+                        status=self.exchange_client.current_order.status,
+                        filled_size=self.exchange_client.current_order.filled_size
+                    )
+                    self.logger.log(f"[OPEN] 从WebSocket更新订单状态为 {order_result.status}", "DEBUG")
+                else:
+                    # 降级到REST API获取订单状态
+                    order_info = await self.exchange_client.get_order_info(order_result.order_id)
+                    if order_info:
+                        order_result = OrderResult(
+                            success=True,
+                            order_id=order_result.order_id,
+                            side=order_info.side,
+                            size=order_info.size,
+                            price=order_info.price,
+                            status=order_info.status,
+                            filled_size=order_info.filled_size
+                        )
+                        self.logger.log(f"[OPEN] 从REST API更新订单状态为 {order_result.status}", "DEBUG")
             
             # Handle order result
             return await self._handle_order_result(order_result)
@@ -250,7 +268,7 @@ class TradingBot:
             return False
 
     async def _handle_order_result(self, order_result) -> bool:
-        """Handle the result of an order placement."""
+        """Handle the result of an order placement - 兼容WebSocket和REST API模式."""
         order_id = order_result.order_id
         filled_price = order_result.price
 
@@ -480,9 +498,27 @@ class TradingBot:
                         start_time = time.time()
                         while time.time() - start_time < 10:
                             if self.config.exchange == "lighter":
-                                if self.exchange_client.current_order and self.exchange_client.current_order.status == 'FILLED':
-                                    self.logger.log(f"[OPEN] 订单已成交 ✓", "INFO")
+                                # 优先使用WebSocket检查（如果启用）
+                                if (hasattr(self.exchange_client, 'use_websocket') and 
+                                    self.exchange_client.use_websocket and
+                                    self.exchange_client.current_order and 
+                                    self.exchange_client.current_order.status == 'FILLED'):
+                                    self.logger.log(f"[OPEN] WebSocket检测到订单已成交 ✓", "INFO")
                                     # 递归调用处理成交订单
+                                    filled_result = OrderResult(
+                                        success=True,
+                                        order_id=order_id,
+                                        side=self.config.direction,
+                                        size=self.config.quantity,
+                                        price=new_order_price,
+                                        status='FILLED'
+                                    )
+                                    return await self._handle_order_result(filled_result)
+                                
+                                # 降级使用REST API检查
+                                order_info = await self.exchange_client.get_order_info(order_id)
+                                if order_info and order_info.status == 'FILLED':
+                                    self.logger.log(f"[OPEN] REST API检测到订单已成交 ✓", "INFO")
                                     filled_result = OrderResult(
                                         success=True,
                                         order_id=order_id,
@@ -541,7 +577,15 @@ class TradingBot:
                 return False
 
             if self.config.exchange == "lighter":
-                current_order_status = self.exchange_client.current_order.status
+                # 优先使用WebSocket（如果启用）
+                if (hasattr(self.exchange_client, 'use_websocket') and 
+                    self.exchange_client.use_websocket and 
+                    self.exchange_client.current_order):
+                    current_order_status = self.exchange_client.current_order.status
+                else:
+                    # 降级到REST API
+                    order_info = await self.exchange_client.get_order_info(order_id)
+                    current_order_status = order_info.status if order_info else "OPEN"
             else:
                 order_info = await self.exchange_client.get_order_info(order_id)
                 current_order_status = order_info.status
@@ -553,7 +597,15 @@ class TradingBot:
                 self.logger.log(f"[OPEN] [{order_id}] Waiting for order to be filled @ {order_result.price}", "INFO")
                 await asyncio.sleep(5)
                 if self.config.exchange == "lighter":
-                    current_order_status = self.exchange_client.current_order.status
+                    # 优先使用WebSocket（如果启用）
+                    if (hasattr(self.exchange_client, 'use_websocket') and 
+                        self.exchange_client.use_websocket and 
+                        self.exchange_client.current_order):
+                        current_order_status = self.exchange_client.current_order.status
+                    else:
+                        # 降级到REST API
+                        order_info = await self.exchange_client.get_order_info(order_id)
+                        current_order_status = order_info.status if order_info else "OPEN"
                 else:
                     order_info = await self.exchange_client.get_order_info(order_id)
                     if order_info is not None:
@@ -566,14 +618,35 @@ class TradingBot:
             if self.config.exchange == "lighter":
                 cancel_result = await self.exchange_client.cancel_order(order_id)
                 start_time = time.time()
-                while (time.time() - start_time < 10 and self.exchange_client.current_order.status != 'CANCELED' and
-                        self.exchange_client.current_order.status != 'FILLED'):
-                    await asyncio.sleep(0.1)
+                
+                # 优先使用WebSocket监控取消状态（如果启用）
+                if (hasattr(self.exchange_client, 'use_websocket') and 
+                    self.exchange_client.use_websocket and 
+                    self.exchange_client.current_order):
+                    while (time.time() - start_time < 10 and 
+                           self.exchange_client.current_order.status != 'CANCELED' and
+                           self.exchange_client.current_order.status != 'FILLED'):
+                        await asyncio.sleep(0.1)
 
-                if self.exchange_client.current_order.status not in ['CANCELED', 'FILLED']:
-                    raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
+                    if self.exchange_client.current_order.status not in ['CANCELED', 'FILLED']:
+                        raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
+                    else:
+                        self.order_filled_amount = self.exchange_client.current_order.filled_size
                 else:
-                    self.order_filled_amount = self.exchange_client.current_order.filled_size
+                    # 降级到REST API轮询订单状态
+                    while time.time() - start_time < 10:
+                        order_info = await self.exchange_client.get_order_info(order_id)
+                        if order_info and order_info.status in ['CANCELED', 'FILLED']:
+                            self.order_filled_amount = order_info.filled_size
+                            break
+                        await asyncio.sleep(0.5)
+                    else:
+                        # 超时，尝试获取最新状态
+                        order_info = await self.exchange_client.get_order_info(order_id)
+                        if order_info:
+                            self.order_filled_amount = order_info.filled_size
+                        else:
+                            raise Exception(f"[OPEN] Error cancelling order: timeout")
             else:
                 try:
                     cancel_result = await self.exchange_client.cancel_order(order_id)

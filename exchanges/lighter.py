@@ -60,11 +60,15 @@ class LighterClient(BaseExchangeClient):
         self.current_order_client_id = None
         self.current_order = None
 
+        # WebSocket控制开关 - 默认禁用，改为使用REST API
+        self.use_websocket = os.getenv('USE_WEBSOCKET', 'false').lower() in ['true', '1', 'yes']
+        
         # WebSocket-based order tracking (NEW: for event-driven order monitoring)
         self.active_orders_dict = {}  # {order_id: OrderInfo}
         self.order_update_event = asyncio.Event()  # Triggered on any order update
         self.ws_connected = False  # Track WebSocket connection status
         self.last_ws_update_time = 0  # Last time we received a WS update
+        self.ws_manager = None  # WebSocket manager instance
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
@@ -135,28 +139,36 @@ class LighterClient(BaseExchangeClient):
             # Initialize Lighter client
             await self._initialize_lighter_client()
 
-            # Add market config to config for WebSocket manager
-            self.config.market_index = self.config.contract_id
-            self.config.account_index = self.account_index
-            self.config.lighter_client = self.lighter_client
+            # 根据配置决定是否启用WebSocket
+            if self.use_websocket:
+                self.logger.log("✅ WebSocket模式已启用", "INFO")
+                
+                # Add market config to config for WebSocket manager
+                self.config.market_index = self.config.contract_id
+                self.config.account_index = self.account_index
+                self.config.lighter_client = self.lighter_client
 
-            # Initialize WebSocket manager (using custom implementation)
-            self.ws_manager = LighterCustomWebSocketManager(
-                config=self.config,
-                order_update_callback=self._handle_websocket_order_update
-            )
+                # Initialize WebSocket manager (using custom implementation)
+                self.ws_manager = LighterCustomWebSocketManager(
+                    config=self.config,
+                    order_update_callback=self._handle_websocket_order_update
+                )
 
-            # Set logger for WebSocket manager
-            self.ws_manager.set_logger(self.logger)
+                # Set logger for WebSocket manager
+                self.ws_manager.set_logger(self.logger)
 
-            # Start WebSocket connection in background task
-            asyncio.create_task(self.ws_manager.connect())
-            # Wait a moment for connection to establish
-            await asyncio.sleep(2)
-            
-            # Mark WebSocket as connected
-            self.ws_connected = True
-            self.last_ws_update_time = time.time()
+                # Start WebSocket connection in background task
+                asyncio.create_task(self.ws_manager.connect())
+                # Wait a moment for connection to establish
+                await asyncio.sleep(2)
+                
+                # Mark WebSocket as connected
+                self.ws_connected = True
+                self.last_ws_update_time = time.time()
+            else:
+                self.logger.log("🔄 REST API模式已启用（WebSocket已禁用）", "INFO")
+                self.ws_connected = False
+                self.ws_manager = None
 
         except Exception as e:
             self.logger.log(f"Error connecting to Lighter: {e}", "ERROR")
@@ -288,21 +300,49 @@ class LighterClient(BaseExchangeClient):
 
     @query_retry(default_return=(0, 0))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        """Get orderbook using official SDK."""
-        # Use WebSocket data if available
-        if (hasattr(self, 'ws_manager') and
-                self.ws_manager.best_bid and self.ws_manager.best_ask):
+        """Get orderbook - 优先使用WebSocket，降级到REST API."""
+        # 优先使用 WebSocket 数据（如果已启用且可用）
+        if (self.use_websocket and 
+            hasattr(self, 'ws_manager') and self.ws_manager and
+            self.ws_manager.best_bid and self.ws_manager.best_ask):
             best_bid = Decimal(str(self.ws_manager.best_bid))
             best_ask = Decimal(str(self.ws_manager.best_ask))
 
+            if best_bid > 0 and best_ask > 0 and best_bid < best_ask:
+                return best_bid, best_ask
+            else:
+                self.logger.log("WebSocket价格无效，降级到REST API", "WARNING")
+        
+        # 降级到 REST API 获取盘口价格
+        try:
+            order_api = lighter.OrderApi(self.api_client)
+            # 使用 order_book_orders 获取实时盘口订单（bids 和 asks）
+            orderbook = await order_api.order_book_orders(market_id=contract_id, limit=1)
+            
+            if not orderbook:
+                self.logger.log("无法从REST API获取盘口数据", "ERROR")
+                raise ValueError("No orderbook data available from REST API")
+            
+            # 获取最优买卖价（第一个订单就是最优价格）
+            best_bid = Decimal('0')
+            best_ask = Decimal('0')
+            
+            if orderbook.bids and len(orderbook.bids) > 0:
+                best_bid = Decimal(str(orderbook.bids[0].price))
+            
+            if orderbook.asks and len(orderbook.asks) > 0:
+                best_ask = Decimal(str(orderbook.asks[0].price))
+            
             if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
-                self.logger.log("Invalid bid/ask prices", "ERROR")
-                raise ValueError("Invalid bid/ask prices")
-        else:
-            self.logger.log("Unable to get bid/ask prices from WebSocket.", "ERROR")
-            raise ValueError("WebSocket not running. No bid/ask prices available")
-
-        return best_bid, best_ask
+                self.logger.log(f"REST API返回无效价格: bid={best_bid}, ask={best_ask}", "ERROR")
+                raise ValueError("Invalid bid/ask prices from REST API")
+            
+            self.logger.log(f"📡 REST API盘口: bid={best_bid}, ask={best_ask}", "DEBUG")
+            return best_bid, best_ask
+            
+        except Exception as e:
+            self.logger.log(f"REST API获取盘口价格失败: {e}", "ERROR")
+            raise
 
     async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
         """Submit an order with Lighter using official SDK."""
@@ -409,7 +449,7 @@ class LighterClient(BaseExchangeClient):
         return order_result
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
-        """Place an open order with Lighter using official SDK."""
+        """Place an open order with Lighter - 优先WebSocket，降级到REST API."""
 
         # Note: current_order and current_order_client_id will be reset in _submit_order_with_retry
         order_price = await self.get_order_price(direction)
@@ -427,13 +467,13 @@ class LighterClient(BaseExchangeClient):
         self.logger.log(f"[OPEN] 等待订单成交，订单ID={order_result.order_id}", "DEBUG")
         
         while time.time() - start_time < max_wait:
-            # Check if order is filled via WebSocket
-            if self.current_order and self.current_order.status == 'FILLED':
+            # 优先通过 WebSocket 检查订单状态（如果启用）
+            if self.use_websocket and self.current_order and self.current_order.status == 'FILLED':
                 order_status = 'FILLED'
                 self.logger.log(f"[OPEN] WebSocket 检测到订单已成交", "DEBUG")
                 break
             
-            # Also check via REST API
+            # 降级使用 REST API 检查订单状态
             order_info = await self.get_order_info(order_result.order_id)
             if order_info and order_info.status == 'FILLED':
                 order_status = 'FILLED'
@@ -442,21 +482,26 @@ class LighterClient(BaseExchangeClient):
             
             await asyncio.sleep(0.5)
         
-        # If still not filled after 10 seconds, get final status
+        # 如果10秒后仍未成交，获取最终状态
         if order_status != 'FILLED':
             order_info = await self.get_order_info(order_result.order_id)
             if order_info:
                 order_status = order_info.status
                 self.logger.log(f"[OPEN] 10秒后订单状态={order_status}", "WARNING")
             else:
-                order_status = self.current_order.status if self.current_order else 'OPEN'
-                self.logger.log(f"[OPEN] 无法获取订单状态，使用默认状态={order_status}", "WARNING")
+                # 如果REST API也无法获取状态，使用WebSocket状态（如果有）
+                if self.use_websocket and self.current_order:
+                    order_status = self.current_order.status
+                    self.logger.log(f"[OPEN] 使用WebSocket状态={order_status}", "WARNING")
+                else:
+                    order_status = 'OPEN'
+                    self.logger.log(f"[OPEN] 无法获取订单状态，使用默认状态={order_status}", "WARNING")
 
         self.logger.log(f"[OPEN] 最终状态={order_status}，将传递给 _handle_order_result", "DEBUG")
         
         return OrderResult(
             success=True,
-            order_id=order_result.order_id,  # Use the order_id from place_limit_order result
+            order_id=order_result.order_id,
             side=direction,
             size=quantity,
             price=order_price,
@@ -533,38 +578,63 @@ class LighterClient(BaseExchangeClient):
             return OrderResult(success=False, error_message='Failed to send cancellation transaction')
 
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
-        """Get order information from Lighter using official SDK."""
+        """Get order information from Lighter - 优先WebSocket，降级到REST API."""
         try:
-            # Use shared API client to get account info
+            # 优先使用 WebSocket 缓存数据（如果启用）
+            if self.use_websocket and order_id in self.active_orders_dict:
+                order_info = self.active_orders_dict[order_id]
+                self.logger.log(f"📡 从WebSocket缓存获取订单 {order_id} 状态={order_info.status}", "DEBUG")
+                return order_info
+            
+            # 降级到 REST API：获取活动订单
+            order_list = await self._fetch_orders_with_retry()
+            
+            for order in order_list:
+                if str(order.order_index) == str(order_id):
+                    side = "sell" if order.is_ask else "buy"
+                    order_info = OrderInfo(
+                        order_id=str(order.order_index),
+                        side=side,
+                        size=Decimal(order.initial_base_amount),
+                        price=Decimal(order.price),
+                        status=order.status.upper(),
+                        filled_size=Decimal(order.filled_base_amount),
+                        remaining_size=Decimal(order.remaining_base_amount)
+                    )
+                    self.logger.log(f"📡 从REST API获取订单 {order_id} 状态={order_info.status}", "DEBUG")
+                    
+                    # 更新到缓存（如果启用WebSocket）
+                    if self.use_websocket:
+                        self.active_orders_dict[order_id] = order_info
+                    
+                    return order_info
+            
+            # 如果在活动订单中没找到，可能已经成交或取消
+            # 检查账户持仓来判断是否已成交
             account_api = lighter.AccountApi(self.api_client)
-
-            # Get account orders
             account_data = await account_api.account(by="index", value=str(self.account_index))
 
-            # Check if we have account data
-            if not account_data or not account_data.accounts:
-                self.logger.log("No account data available", "WARNING")
-                return None
+            if account_data and account_data.accounts:
+                for position in account_data.accounts[0].positions:
+                    if position.symbol == self.config.ticker:
+                        position_amt = abs(float(position.position))
+                        if position_amt > 0.001:
+                            # 有持仓，说明订单可能已成交
+                            return OrderInfo(
+                                order_id=order_id,
+                                side="buy" if float(position.position) > 0 else "sell",
+                                size=Decimal(str(position_amt)),
+                                price=Decimal(str(position.avg_entry_price)),  # ✅ 修复：使用正确的属性名
+                                status="FILLED",
+                                filled_size=Decimal(str(position_amt)),
+                                remaining_size=Decimal('0')
+                            )
 
-            # Look for the specific order in account positions
-            for position in account_data.accounts[0].positions:
-                if position.symbol == self.config.ticker:
-                    position_amt = abs(float(position.position))
-                    if position_amt > 0.001:  # Only include significant positions
-                        return OrderInfo(
-                            order_id=order_id,
-                            side="buy" if float(position.position) > 0 else "sell",
-                            size=Decimal(str(position_amt)),
-                            price=Decimal(str(position.avg_price)),
-                            status="FILLED",  # Positions are filled orders
-                            filled_size=Decimal(str(position_amt)),
-                            remaining_size=Decimal('0')
-                        )
-
+            self.logger.log(f"订单 {order_id} 未找到（可能已取消或完成）", "DEBUG")
             return None
 
         except Exception as e:
-            self.logger.log(f"Error getting order info: {e}", "ERROR")
+            self.logger.log(f"获取订单信息失败: {e}", "ERROR")
             return None
 
     @query_retry(reraise=True)
@@ -599,46 +669,50 @@ class LighterClient(BaseExchangeClient):
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract.
         
-        NEW BEHAVIOR: 
-        - Prefer WebSocket data if connected and recently updated
-        - Fallback to REST API if WebSocket is stale or disconnected
+        BEHAVIOR: 
+        - 如果启用WebSocket且健康：优先使用WebSocket数据
+        - 否则：使用REST API
         """
-        # Check if WebSocket is healthy (updated within last 30 seconds)
+        # 检查 WebSocket 是否健康（30秒内有更新）
         ws_is_healthy = (
+            self.use_websocket and
             self.ws_connected and 
             self.last_ws_update_time > 0 and
             (time.time() - self.last_ws_update_time) < 30
         )
         
-        # If WebSocket is healthy, use in-memory data
+        # 如果 WebSocket 健康，使用内存中的订单数据
         if ws_is_healthy and len(self.active_orders_dict) >= 0:
-            # Return active orders from WebSocket updates
+            # 从 WebSocket 更新返回活动订单
             orders = list(self.active_orders_dict.values())
-            # Log WebSocket usage (DEBUG level to reduce noise)
-            # Note: Order updates via WebSocket are logged in _handle_websocket_order_update
+            # 记录 WebSocket 使用情况（DEBUG级别减少日志噪音）
             if self.last_ws_update_time > 0:
                 ws_age = int(time.time() - self.last_ws_update_time)
-                self.logger.log(f"📡 Using WebSocket data ({len(orders)} orders, WS更新于 {ws_age}秒前)", "DEBUG")
+                self.logger.log(f"📡 使用WebSocket数据 ({len(orders)} 订单, 更新于 {ws_age}秒前)", "DEBUG")
             return orders
         
-        # Fallback to REST API
-        self.logger.log("🔄 WebSocket stale or disconnected, using REST API", "WARNING")
+        # 降级到 REST API
+        if self.use_websocket:
+            self.logger.log("🔄 WebSocket过期或断开，降级到REST API", "WARNING")
+        else:
+            self.logger.log("🔄 使用REST API获取活动订单", "DEBUG")
+            
         order_list = await self._fetch_orders_with_retry()
 
-        # Filter orders for the specific market
+        # 过滤特定市场的订单
         contract_orders = []
         for order in order_list:
-            # Convert Lighter Order to OrderInfo
+            # 将 Lighter Order 转换为 OrderInfo
             side = "sell" if order.is_ask else "buy"
             size = Decimal(order.initial_base_amount)
             price = Decimal(order.price)
 
-            # Only include orders with remaining size > 0
+            # 只包含剩余数量 > 0 的订单
             if size > 0:
                 order_info = OrderInfo(
                     order_id=str(order.order_index),
                     side=side,
-                    size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
+                    size=Decimal(order.remaining_base_amount),
                     price=price,
                     status=order.status.upper(),
                     filled_size=Decimal(order.filled_base_amount),
@@ -646,8 +720,9 @@ class LighterClient(BaseExchangeClient):
                 )
                 contract_orders.append(order_info)
                 
-                # Sync to active_orders_dict
-                self.active_orders_dict[order_info.order_id] = order_info
+                # 同步到 active_orders_dict（如果启用了WebSocket）
+                if self.use_websocket:
+                    self.active_orders_dict[order_info.order_id] = order_info
 
         return contract_orders
     
