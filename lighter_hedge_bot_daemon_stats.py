@@ -96,6 +96,9 @@ class DaemonBot:
         self.proc: Optional[subprocess.Popen] = None
         self.ready = False
         
+        # 使用env文件名作为标识（去掉路径和.env后缀）
+        self.env_name = Path(env_file).stem
+        
         self.color = {
             1: Colors.RED,
             2: Colors.GREEN,
@@ -118,14 +121,14 @@ class DaemonBot:
             data = json.loads(response)
             if data.get('status') == 'ready':
                 self.ready = True
-                print(f"{self.color}✓ Bot{self.bot_id}{Colors.RESET} 守护进程已启动 (PID: {self.proc.pid})")
+                print(f"{self.color}✓ {self.env_name}{Colors.RESET} 守护进程已启动 (PID: {self.proc.pid})")
                 return True
             else:
-                print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 启动失败: {data}")
+                print(f"{self.color}✗ {self.env_name}{Colors.RESET} 启动失败: {data}")
                 return False
                 
         except Exception as e:
-            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 启动异常: {e}")
+            print(f"{self.color}✗ {self.env_name}{Colors.RESET} 启动异常: {e}")
             return False
     
     def send_trade_command(self, ticker: str, quantity: Decimal, direction: str, 
@@ -147,11 +150,11 @@ class DaemonBot:
             self.proc.stdin.write(json.dumps(cmd) + '\n')
             self.proc.stdin.flush()
             
-            print(f"  {self.color}→ Bot{self.bot_id}{Colors.RESET}: {direction} {quantity} {ticker} @ TP={take_profit}%")
+            print(f"  {self.color}→ {self.env_name}{Colors.RESET}: {direction} {quantity} {ticker} @ TP={take_profit}%")
             return True
             
         except Exception as e:
-            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 发送指令失败: {e}")
+            print(f"{self.color}✗ {self.env_name}{Colors.RESET} 发送指令失败: {e}")
             return False
     
     def wait_for_completion(self, timeout: float = 7500) -> dict:
@@ -179,12 +182,12 @@ class DaemonBot:
                     
                     if response.get('type') == 'log':
                         msg = response.get('message', '')
-                        print(f"    {self.color}[Bot{self.bot_id}]{Colors.RESET} {msg}")
+                        print(f"    {self.color}[{self.env_name}]{Colors.RESET} {msg}")
                         continue
                     
                     if 'success' in response:
                         if response['success']:
-                            print(f"  {self.color}✓ Bot{self.bot_id}{Colors.RESET} 交易完成")
+                            print(f"  {self.color}✓ {self.env_name}{Colors.RESET} 交易完成")
                             # 返回结果（包含stats）
                             return {
                                 'success': True,
@@ -192,12 +195,13 @@ class DaemonBot:
                             }
                         else:
                             error = response.get('error', 'UNKNOWN')
-                            print(f"  {self.color}✗ Bot{self.bot_id}{Colors.RESET} 交易失败: {error}")
+                            print(f"  {self.color}✗ {self.env_name}{Colors.RESET} 交易失败: {error}")
                             if error == 'TIMEOUT':
                                 return {
                                     'success': False,
                                     'error': 'TIMEOUT',
                                     'bot_id': self.bot_id,
+                                    'env_name': self.env_name,
                                     'stats': response.get('stats', {})
                                 }
                             return {
@@ -207,14 +211,14 @@ class DaemonBot:
                             }
                             
                 except json.JSONDecodeError:
-                    print(f"    {self.color}[Bot{self.bot_id}]{Colors.RESET} {line}")
+                    print(f"    {self.color}[{self.env_name}]{Colors.RESET} {line}")
                     continue
             
-            print(f"  {self.color}⏱ Bot{self.bot_id}{Colors.RESET} 等待超时（主进程超时）")
+            print(f"  {self.color}⏱ {self.env_name}{Colors.RESET} 等待超时（主进程超时）")
             return {'success': False, 'error': 'MAIN_TIMEOUT'}
             
         except Exception as e:
-            print(f"{self.color}✗ Bot{self.bot_id}{Colors.RESET} 等待异常: {e}")
+            print(f"{self.color}✗ {self.env_name}{Colors.RESET} 等待异常: {e}")
             return {'success': False, 'error': str(e)}
     
     def stop(self):
@@ -346,8 +350,8 @@ def main():
         qty3 = (qty_main - qty2).quantize(Decimal('0.00000001'))
         
         print(f"交易对: {ticker}")
-        print(f"方向: Bot1={direction_main}, Bot2/3={direction_hedge}")
-        print(f"数量: Bot1={qty_main}, Bot2={qty2}, Bot3={qty3}")
+        print(f"方向: {bots[0].env_name}={direction_main}, {bots[1].env_name}/{bots[2].env_name}={direction_hedge}")
+        print(f"数量: {bots[0].env_name}={qty_main}, {bots[1].env_name}={qty2}, {bots[2].env_name}={qty3}")
         print(f"杠杆: {leverage}x, 目标收益: {profit_pct}%\n")
         
         # 发送交易指令
@@ -378,11 +382,11 @@ def main():
         
         # 检查超时错误
         timeout_detected = False
-        for result in results:
+        for idx, result in enumerate(results):
             if result and result.get('error') == 'TIMEOUT':
                 timeout_detected = True
-                bot_id = result.get('bot_id', '?')
-                print(f"\n❌ Bot{bot_id} 止盈止损等待超时，停止整个程序！\n")
+                env_name = result.get('env_name', bots[idx].env_name)
+                print(f"\n❌ {env_name} 止盈止损等待超时，停止整个程序！\n")
                 break
         
         if timeout_detected:
