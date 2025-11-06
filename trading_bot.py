@@ -345,22 +345,50 @@ class TradingBot:
                         # 等待 0.2 秒，确保下一个订单的 client_order_index 不同
                         await asyncio.sleep(0.2)
                         
-                        self.logger.log(f"[TP/SL] 准备下市价止损订单: {close_side} @ 市价 (触发价={sl_price})", "INFO")
+                        # 激进限价止损策略：
+                        # 使用 STOP_LOSS_LIMIT，但限价比触发价更激进，确保快速成交
+                        # 例如：卖单止损时，限价比触发价低1%，几乎必然成交
+                        
+                        # 可配置的滑点容忍度（默认1%）
+                        sl_slippage_pct = Decimal(os.getenv("STOP_LOSS_SLIPPAGE_PCT", "1.0"))
+                        
+                        # 计算激进限价：
+                        # - 卖单止损：限价 = 触发价 * (1 - 滑点%)
+                        # - 买单止损：限价 = 触发价 * (1 + 滑点%)
+                        if close_side == 'sell':
+                            sl_limit_price = sl_price * (Decimal('1') - sl_slippage_pct / Decimal('100'))
+                        else:
+                            sl_limit_price = sl_price * (Decimal('1') + sl_slippage_pct / Decimal('100'))
+                        
+                        # 对齐到 tick size
+                        sl_limit_price = round_tick(sl_limit_price)
+                        
+                        self.logger.log(
+                            f"[TP/SL] 准备下激进限价止损: {close_side} @ 限价{sl_limit_price} "
+                            f"(触发价={sl_price}, 滑点容忍={sl_slippage_pct}%)",
+                            "INFO"
+                        )
+                        
                         sl_res = await self.exchange_client.place_limit_order(
                             self.config.contract_id,
                             self.config.quantity,
-                            sl_price,
+                            sl_limit_price,  # 使用激进限价
                             close_side,
-                            order_type='STOP_LOSS',  # 按SDK示例：市价止损
-                            trigger_price=sl_price,
+                            order_type='STOP_LOSS_LIMIT',  # 限价止损
+                            trigger_price=sl_price,  # 触发价
                             post_only=False,
-                            reduce_only=True  # ✅ 仅减仓，防止误开反向仓位
+                            reduce_only=True
                         )
                         if not sl_res.success:
                             self.logger.log(f"[SL] Failed: {sl_res.error_message}", "ERROR")
                             raise Exception(f"[SL] Failed: {sl_res.error_message}")
                         
-                        self.logger.log(f"[SL] 市价止损订单已下单 ✓ Order ID: {sl_res.order_id} (触发后以市价成交)", "INFO")
+                        self.logger.log(
+                            f"[SL] 激进限价止损已下单 ✓ Order ID: {sl_res.order_id} "
+                            f"(触发价={sl_price}, 限价={sl_limit_price})",
+                            "INFO"
+                        )
+                        
                         self.sl_order_id = sl_res.order_id  # 保存止损订单ID
                         
                         await asyncio.sleep(1)
