@@ -393,9 +393,9 @@ class LighterClient(BaseExchangeClient):
         Args:
             contract_id: Market contract ID
             quantity: Order quantity
-            price: Limit price
+            price: Limit price (for LIMIT orders) or fallback price (for market TP/SL orders)
             side: 'buy' or 'sell'
-            order_type: 'LIMIT', 'TAKE_PROFIT_LIMIT', or 'STOP_LOSS_LIMIT'
+            order_type: 'LIMIT', 'TAKE_PROFIT_LIMIT', 'STOP_LOSS_LIMIT', 'TAKE_PROFIT', or 'STOP_LOSS'
             trigger_price: Trigger price for TP/SL orders
             post_only: If True, order will only be placed as maker (default: True)
             reduce_only: If True, order will only reduce position (default: False)
@@ -421,16 +421,25 @@ class LighterClient(BaseExchangeClient):
             ot = self.lighter_client.ORDER_TYPE_TAKE_PROFIT_LIMIT
         elif order_type == 'STOP_LOSS_LIMIT':
             ot = self.lighter_client.ORDER_TYPE_STOP_LOSS_LIMIT
+        elif order_type == 'TAKE_PROFIT':
+            ot = self.lighter_client.ORDER_TYPE_TAKE_PROFIT
+        elif order_type == 'STOP_LOSS':
+            ot = self.lighter_client.ORDER_TYPE_STOP_LOSS
         else:
             ot = self.lighter_client.ORDER_TYPE_LIMIT
 
-        # Determine time_in_force based on post_only setting
-        if post_only:
+        # Determine time_in_force based on order type and post_only setting
+        # 市价止盈止损订单（STOP_LOSS/TAKE_PROFIT）需要等待触发，使用 GOOD_TILL_TIME
+        # 普通限价单可以使用 POST_ONLY
+        if post_only and order_type == 'LIMIT':
             tif = self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY
             self.logger.log(f"[ORDER] 使用 POST_ONLY 模式（仅挂单，不吃单）", "DEBUG")
         else:
             tif = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-            self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式", "DEBUG")
+            if order_type in ['STOP_LOSS', 'TAKE_PROFIT']:
+                self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式（市价止盈止损）", "DEBUG")
+            else:
+                self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式", "DEBUG")
         
         # Create order parameters
         order_params = {
