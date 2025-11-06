@@ -322,15 +322,15 @@ class TradingBot:
                     self.logger.log(f"[TP/SL] 杠杆={leverage}x, 目标收益={self.config.take_profit}%, 价格变动={price_change_pct*100:.4f}%", "INFO")
                     self.logger.log(f"[TP/SL] 开仓价={filled_price}, TP={tp_price} ({((tp_price/filled_price-1)*100):.4f}%), SL={sl_price} ({((sl_price/filled_price-1)*100):.4f}%)", "INFO")
 
-                    # For Lighter exchange, use proper TP/SL order types。限价止盈，市价止损
+                    # For Lighter exchange, use market TP/SL order types (按SDK示例)
                     if self.config.exchange == "lighter":
-                        self.logger.log(f"[TP/SL] 准备下市价止盈订单: {close_side} @ 市价 (触发价={tp_price})", "INFO")
+                        self.logger.log(f"[TP/SL] 准备下限价止盈订单: {close_side} @ {tp_price} (触发价={tp_price})", "INFO")
                         tp_res = await self.exchange_client.place_limit_order(
                             self.config.contract_id,
                             self.config.quantity,
                             tp_price,
                             close_side,
-                            order_type='TAKE_PROFIT_LIMIT',  # 限价止盈
+                            order_type='TAKE_PROFIT_LIMIT',  # 按SDK示例：限价止盈
                             trigger_price=tp_price,
                             post_only=False,
                             reduce_only=True  # ✅ 仅减仓，防止误开反向仓位
@@ -339,7 +339,7 @@ class TradingBot:
                             self.logger.log(f"[TP] Failed: {tp_res.error_message}", "ERROR")
                             raise Exception(f"[TP] Failed: {tp_res.error_message}")
                         
-                        self.logger.log(f"[TP] 市价止盈订单已下单 ✓ Order ID: {tp_res.order_id} (type={type(tp_res.order_id)})", "INFO")
+                        self.logger.log(f"[TP] 限价止盈订单已下单 ✓ Order ID: {tp_res.order_id} (触发后以{tp_price}限价成交)", "INFO")
                         self.tp_order_id = tp_res.order_id  # 保存止盈订单ID
                         
                         # 等待 0.2 秒，确保下一个订单的 client_order_index 不同
@@ -349,18 +349,18 @@ class TradingBot:
                         sl_res = await self.exchange_client.place_limit_order(
                             self.config.contract_id,
                             self.config.quantity,
-                            sl_price,  # 作为保护价格，实际以市价成交
+                            sl_price,
                             close_side,
-                            order_type='STOP_LOSS',  # ✅ 改为市价止损
+                            order_type='STOP_LOSS',  # 按SDK示例：市价止损
                             trigger_price=sl_price,
-                            post_only=False,  # 市价订单不使用 POST_ONLY
+                            post_only=False,
                             reduce_only=True  # ✅ 仅减仓，防止误开反向仓位
                         )
                         if not sl_res.success:
                             self.logger.log(f"[SL] Failed: {sl_res.error_message}", "ERROR")
                             raise Exception(f"[SL] Failed: {sl_res.error_message}")
                         
-                        self.logger.log(f"[SL] 市价止损订单已下单 ✓ Order ID: {sl_res.order_id} (type={type(sl_res.order_id)})", "INFO")
+                        self.logger.log(f"[SL] 市价止损订单已下单 ✓ Order ID: {sl_res.order_id} (触发后以市价成交)", "INFO")
                         self.sl_order_id = sl_res.order_id  # 保存止损订单ID
                         
                         await asyncio.sleep(1)

@@ -428,18 +428,28 @@ class LighterClient(BaseExchangeClient):
         else:
             ot = self.lighter_client.ORDER_TYPE_LIMIT
 
-        # Determine time_in_force based on order type and post_only setting
-        # 市价止盈止损订单（STOP_LOSS/TAKE_PROFIT）需要等待触发，使用 GOOD_TILL_TIME
-        # 普通限价单可以使用 POST_ONLY
-        if post_only and order_type == 'LIMIT':
-            tif = self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY
-            self.logger.log(f"[ORDER] 使用 POST_ONLY 模式（仅挂单，不吃单）", "DEBUG")
+        # Determine time_in_force and order_expiry based on order type and post_only setting
+        # 完全按照SDK示例设置参数
+        if order_type in ['STOP_LOSS', 'TAKE_PROFIT']:
+            # 市价止盈止损：按照SDK的create_tp_order和create_sl_order示例
+            tif = self.lighter_client.DEFAULT_IOC_EXPIRY  # 0 (IOC)
+            order_expiry = self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY  # -1
+            self.logger.log(f"[ORDER] 市价止盈止损：time_in_force=IOC(0), order_expiry=28天(-1)", "DEBUG")
+        elif order_type in ['STOP_LOSS_LIMIT', 'TAKE_PROFIT_LIMIT']:
+            # 限价止盈止损：按照SDK的create_tp_limit_order和create_sl_limit_order示例
+            tif = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME  # 1 (GTT)
+            order_expiry = self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY  # -1
+            self.logger.log(f"[ORDER] 限价止盈止损：time_in_force=GTT(1), order_expiry=28天(-1)", "DEBUG")
+        elif post_only and order_type == 'LIMIT':
+            # 普通限价单POST_ONLY
+            tif = self.lighter_client.ORDER_TIME_IN_FORCE_POST_ONLY  # 2
+            order_expiry = self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY  # -1
+            self.logger.log(f"[ORDER] 使用 POST_ONLY 模式", "DEBUG")
         else:
-            tif = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-            if order_type in ['STOP_LOSS', 'TAKE_PROFIT']:
-                self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式（市价止盈止损）", "DEBUG")
-            else:
-                self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式", "DEBUG")
+            # 其他普通订单
+            tif = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME  # 1
+            order_expiry = self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY  # -1
+            self.logger.log(f"[ORDER] 使用 GOOD_TILL_TIME 模式", "DEBUG")
         
         # Create order parameters
         order_params = {
@@ -452,6 +462,7 @@ class LighterClient(BaseExchangeClient):
             'time_in_force': tif,
             'reduce_only': reduce_only,
             'trigger_price': int(trigger_price * self.price_multiplier) if trigger_price > 0 else 0,
+            'order_expiry': order_expiry,
         }
 
         order_result = await self._submit_order_with_retry(order_params)
