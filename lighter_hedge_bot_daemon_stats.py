@@ -246,6 +246,9 @@ class DaemonBot:
             3: Colors.YELLOW
         }.get(bot_id, Colors.RESET)
         
+        # 清理失败计数器
+        self.cleanup_failure_count = 0
+        
     def start(self):
         """启动守护进程"""
         try:
@@ -372,10 +375,15 @@ class DaemonBot:
                     
                     if 'success' in response:
                         if response['success']:
-                            print(f"  {self.color}✓ {self.env_name}{Colors.RESET} 交易完成")
+                            # 检查是否是超时完成
+                            if response.get('timeout'):
+                                print(f"  {self.color}⏱ {self.env_name}{Colors.RESET} 交易超时（未触发止盈止损）")
+                            else:
+                                print(f"  {self.color}✓ {self.env_name}{Colors.RESET} 交易完成")
                             # 返回结果（包含stats）
                             return {
                                 'success': True,
+                                'timeout': response.get('timeout', False),
                                 'stats': response.get('stats', {})
                             }
                         else:
@@ -533,8 +541,109 @@ def main():
         print(f"主方向: {direction_main}, 对冲方向: {direction_hedge}")
         print(f"杠杆: {leverage}x, 目标收益: {profit_pct}%\n")
         
-        # ========== 新增：开仓前余额检测 ==========
-        print(f"{Colors.CYAN}正在检测三个账户余额...{Colors.RESET}")
+        # ========== 步骤1：清理检测（并发执行） ==========
+        print(f"{Colors.CYAN}【步骤1/3】检查并清理所有账户（并发）...{Colors.RESET}")
+        
+        # 并发发送清理命令到所有子进程
+        cleanup_cmd = {
+            'action': 'cleanup',
+            'ticker': ticker
+        }
+        
+        # 初始化清理结果字典
+        cleanup_results = {}
+        
+        # 发送命令到所有bot
+        for bot in bots:
+            # 显示失败计数（用于诊断）
+            if bot.cleanup_failure_count > 0:
+                print(f"  {bot.color}[{bot.env_name} 历史失败:{bot.cleanup_failure_count}次]{Colors.RESET}")
+            
+            try:
+                bot.proc.stdin.write(json.dumps(cleanup_cmd) + '\n')
+                bot.proc.stdin.flush()
+                print(f"  → 发送清理命令到 {bot.color}{bot.env_name}{Colors.RESET}")
+            except Exception as e:
+                print(f"  {bot.color}✗ {bot.env_name}{Colors.RESET} 发送命令失败: {e}")
+        
+        print()
+        
+        # 并发等待所有bot的清理结果（最多90秒）
+        start_time = time.time()
+        timeout = 90  # 增加超时时间
+        
+        while time.time() - start_time < timeout:
+            if len(cleanup_results) == len(bots):
+                break  # 所有bot都返回结果了
+            
+            # 小延迟避免CPU占用过高
+            time.sleep(0.05)
+            
+            for bot in bots:
+                if bot.env_name in cleanup_results:
+                    continue  # 已经有结果了
+                
+                try:
+                    # 非阻塞读取
+                    import select
+                    ready, _, _ = select.select([bot.proc.stdout], [], [], 0)
+                    if ready:
+                        line = bot.proc.stdout.readline()
+                        if not line:
+                            continue
+                        
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        try:
+                            response = json.loads(line)
+                            
+                            # 跳过日志消息
+                            if response.get('type') == 'log':
+                                msg = response.get('message', '')
+                                print(f"    {bot.color}[{bot.env_name}]{Colors.RESET} {msg}")
+                                continue
+                            
+                            # 清理完成响应
+                            if 'cleanup_success' in response:
+                                cleanup_results[bot.env_name] = response
+                                if response['cleanup_success']:
+                                    print(f"  {bot.color}✓ {bot.env_name}{Colors.RESET} 清理完成")
+                                    # 清理成功，重置失败计数器
+                                    bot.cleanup_failure_count = 0
+                                else:
+                                    error = response.get('error', 'UNKNOWN')
+                                    print(f"  {bot.color}❌ {bot.env_name}{Colors.RESET} 清理失败: {error}")
+                                    # 清理失败，增加失败计数器
+                                    bot.cleanup_failure_count += 1
+                        except json.JSONDecodeError as e:
+                            # 打印调试信息
+                            print(f"    {bot.color}[{bot.env_name}] JSON解析错误: {line[:100]}{Colors.RESET}")
+                            continue
+                except Exception as e:
+                    # 打印异常信息以便调试
+                    print(f"    {bot.color}[{bot.env_name}] 读取异常: {e}{Colors.RESET}")
+                    continue
+        
+        # 检查超时或失败的bot
+        failed_bots = []
+        for bot in bots:
+            if bot.env_name not in cleanup_results:
+                failed_bots.append(bot.env_name)
+                print(f"  {bot.color}⚠ {bot.env_name}{Colors.RESET} 清理超时")
+            elif not cleanup_results[bot.env_name].get('cleanup_success'):
+                failed_bots.append(bot.env_name)
+        
+        if failed_bots:
+            print(f"{Colors.YELLOW}⚠️ {len(failed_bots)} 个账户清理失败/超时，跳过本轮交易{Colors.RESET}")
+            print()
+            continue  # 跳到下一个round
+        
+        print()
+        
+        # ========== 步骤2：余额检测 ==========
+        print(f"{Colors.CYAN}【步骤2/3】检测清理后的账户余额...{Colors.RESET}")
         
         balance_results = []
         for i, bot in enumerate(bots):
@@ -572,7 +681,7 @@ def main():
         balances_sorted = [balances[i] for i in sorted_indices]
         
         # 计算动态开仓数量（使用排序后的余额）
-        print(f"{Colors.CYAN}计算对冲开仓数量...{Colors.RESET}")
+        print(f"{Colors.CYAN}【步骤3/3】计算对冲开仓数量...{Colors.RESET}")
         calc_result = calculate_hedge_quantities(
             balances=balances_sorted,
             price=current_price,

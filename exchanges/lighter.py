@@ -596,6 +596,356 @@ class LighterClient(BaseExchangeClient):
             return OrderResult(success=True)
         else:
             return OrderResult(success=False, error_message='Failed to send cancellation transaction')
+    
+    async def cancel_all_orders(self) -> OrderResult:
+        """Cancel all orders for the account (tx_type=16).
+        
+        根据 Lighter SDK 和 UI 请求示例：
+        - time_in_force: 0 (CANCEL_ALL_TIF_IMMEDIATE)
+        - time: 0
+        """
+        try:
+            # Ensure client is initialized
+            if self.lighter_client is None:
+                await self._initialize_lighter_client()
+            
+            self.logger.log("🗑️ 开始取消所有订单...", "INFO")
+            
+            # Use lighter SDK's cancel_all_orders method
+            # This corresponds to tx_type=16
+            # Parameters based on SDK constants and UI example:
+            # - time_in_force=0 (CANCEL_ALL_TIF_IMMEDIATE)
+            # - time=0
+            tx_info, api_response, error = await self.lighter_client.cancel_all_orders(
+                time_in_force=0,  # CANCEL_ALL_TIF_IMMEDIATE
+                time=0
+            )
+            
+            if error is not None:
+                self.logger.log(f"❌ 取消所有订单失败: {error}", "ERROR")
+                return OrderResult(success=False, error_message=f"Cancel all orders error: {error}")
+            
+            if api_response and api_response.code == 200:
+                self.logger.log(f"✅ 所有订单已取消", "INFO")
+                # Wait a moment for cancellations to be processed
+                await asyncio.sleep(1)
+                return OrderResult(success=True)
+            else:
+                error_code = api_response.code if api_response else 'None'
+                error_msg = api_response.message if api_response and hasattr(api_response, 'message') else 'No message'
+                self.logger.log(
+                    f"❌ 取消订单失败: code={error_code}, message={error_msg}",
+                    "ERROR"
+                )
+                return OrderResult(success=False, error_message=f"code={error_code}, msg={error_msg}")
+                
+        except Exception as e:
+            self.logger.log(f"❌ 取消所有订单异常: {e}", "ERROR")
+            import traceback
+            self.logger.log(f"详细错误: {traceback.format_exc()}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+    
+    async def close_all_positions(self) -> OrderResult:
+        """Close all positions by creating market reduce-only orders."""
+        try:
+            # Ensure client is initialized
+            if self.lighter_client is None:
+                await self._initialize_lighter_client()
+            
+            self.logger.log("🔄 开始平仓所有持仓...", "INFO")
+            
+            # Get current positions
+            positions = await self._fetch_positions_with_retry()
+            
+            closed_positions = 0
+            actual_positions = []
+            
+            # First, filter out real positions (not just orders)
+            for position in positions:
+                position_amount = float(getattr(position, 'position', 0))
+                
+                if abs(position_amount) < 0.00001:  # Skip near-zero positions
+                    continue
+                
+                market_id = getattr(position, 'market_id', None)
+                if market_id is None:
+                    continue
+                
+                actual_positions.append((position, position_amount, market_id))
+            
+            if len(actual_positions) == 0:
+                self.logger.log("ℹ️ 没有实际持仓（可能只有挂单）", "INFO")
+                return OrderResult(success=True)
+            
+            self.logger.log(f"📊 检测到 {len(actual_positions)} 个实际持仓，开始平仓", "INFO")
+            
+            for pos_tuple in actual_positions:
+                position, position_amount, market_id = pos_tuple
+                
+                # 使用sign字段判断持仓方向（重要！position_amount已经是绝对值）
+                # sign > 0 表示多头持仓，需要卖出平仓（is_ask=True）
+                # sign <= 0 表示空头持仓，需要买入平仓（is_ask=False）
+                position_sign = getattr(position, 'sign', 1)
+                is_ask = position_sign > 0
+                base_amount = abs(position_amount)
+                
+                # 检查持仓是否太小（可能是"僵尸持仓"无法平掉）
+                if base_amount < 0.0001:
+                    self.logger.log(
+                        f"⚠️ 持仓太小，跳过: 市场={market_id}, 数量={base_amount:.8f}",
+                        "WARNING"
+                    )
+                    continue
+                
+                self.logger.log(
+                    f"📊 持仓详情: 市场={market_id}, symbol={getattr(position, 'symbol', 'unknown')}, "
+                    f"sign={position_sign}, 方向={'多' if is_ask else '空'}, 数量={base_amount:.8f}, "
+                    f"平仓方向={'SELL' if is_ask else 'BUY'}",
+                    "INFO"
+                )
+                
+                # Get market config for this market
+                market_info = await self._get_market_info(market_id)
+                if not market_info:
+                    self.logger.log(f"⚠️ 无法获取市场 {market_id} 的配置，跳过", "WARNING")
+                    continue
+                
+                base_multiplier = pow(10, market_info.supported_size_decimals)
+                price_multiplier = pow(10, market_info.supported_price_decimals)
+                
+                # Create market reduce-only order (tx_type=14)
+                # Based on SDK's create_market_order and UI example:
+                # - Type=1 (ORDER_TYPE_MARKET)
+                # - TimeInForce=0 (ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL)
+                # - ReduceOnly=1
+                # - OrderExpiry=0 (DEFAULT_IOC_EXPIRY)
+                client_order_index = int(time.time() * 1000) % 1000000
+                
+                self.logger.log(
+                    f"📤 平仓订单: 市场={market_id}, 方向={'SELL' if is_ask else 'BUY'}, "
+                    f"数量={base_amount:.8f}",
+                    "INFO"
+                )
+                
+                # 使用SDK自带的市价限滑点单平仓（方向判断已修复）
+                actual_base_amount = int(base_amount * base_multiplier)
+                max_slippage = 0.01  # 1% 滑点
+                
+                self.logger.log(
+                    f"🔧 使用市价限滑点单: market={market_id}, base_amount={actual_base_amount} ({base_amount:.8f}), "
+                    f"max_slippage=1%, 方向={'SELL' if is_ask else 'BUY'}, reduce_only=True",
+                    "INFO"
+                )
+                
+                # Use SDK's create_market_order_limited_slippage
+                create_order, api_response, error = await self.lighter_client.create_market_order_limited_slippage(
+                    market_index=market_id,
+                    client_order_index=client_order_index,
+                    base_amount=actual_base_amount,
+                    max_slippage=max_slippage,
+                    is_ask=is_ask,
+                    reduce_only=True
+                )
+                
+                # Log detailed response
+                if api_response:
+                    self.logger.log(
+                        f"📡 API响应: code={api_response.code}, "
+                        f"error={error if error else 'None'}",
+                        "INFO"
+                    )
+                    if hasattr(api_response, 'message'):
+                        self.logger.log(f"   message: {api_response.message}", "INFO")
+                else:
+                    self.logger.log(f"📡 API响应为空, error={error}", "ERROR")
+                
+                if error is not None:
+                    self.logger.log(f"❌ 平仓订单失败: {error}", "ERROR")
+                    continue
+                
+                if api_response and api_response.code == 200:
+                    self.logger.log(f"✅ 平仓订单已提交（响应200）", "INFO")
+                    closed_positions += 1
+                else:
+                    error_code = api_response.code if api_response else 'None'
+                    error_msg = api_response.message if api_response and hasattr(api_response, 'message') else 'No message'
+                    self.logger.log(
+                        f"⚠️ 平仓订单提交失败（响应码: {error_code}, 消息: {error_msg}）", 
+                        "WARNING"
+                    )
+            
+            if closed_positions > 0:
+                self.logger.log(f"✅ 已提交 {closed_positions} 个平仓订单", "INFO")
+                
+                # Wait longer for orders to be processed and filled
+                # BaseAmount=0 needs more time for system to process
+                self.logger.log("⏳ 等待平仓订单成交（最多5秒）...", "INFO")
+                await asyncio.sleep(5)
+                
+                # Verify closure by checking positions again
+                self.logger.log("🔍 验证平仓结果...", "INFO")
+                verify_positions = await self._fetch_positions_with_retry()
+                remaining = 0
+                remaining_positions = []
+                
+                for position in verify_positions:
+                    position_amount = abs(float(getattr(position, 'position', 0)))
+                    if position_amount > 0.00001:
+                        remaining += 1
+                        market_id = getattr(position, 'market_id', 'unknown')
+                        # 使用sign字段判断方向，而不是position的正负
+                        position_sign = getattr(position, 'sign', 1)
+                        remaining_positions.append({
+                            'market_id': market_id,
+                            'amount': position_amount,
+                            'is_ask': position_sign > 0  # sign > 0 = 多头 = 卖出平仓
+                        })
+                        self.logger.log(
+                            f"⚠️ 持仓未完全平掉: 市场={market_id}, 剩余={position_amount:.8f}",
+                            "WARNING"
+                        )
+                
+                # Multiple retry attempts (up to 3 times)
+                max_retries = 3
+                for retry_attempt in range(max_retries):
+                    if remaining == 0:
+                        break
+                    
+                    self.logger.log(
+                        f"⚠️ 仍有 {remaining} 个持仓未完全平掉，尝试第{retry_attempt + 1}次重试平仓...",
+                        "WARNING"
+                    )
+                    
+                    # Retry closing remaining positions
+                    retry_closed = 0
+                    for pos_info in remaining_positions:
+                        market_id = pos_info['market_id']
+                        position_amount = pos_info['amount']
+                        is_ask = pos_info['is_ask']
+                        
+                        # Get market info
+                        market_info = await self._get_market_info(market_id)
+                        if not market_info:
+                            continue
+                        
+                        base_multiplier = pow(10, market_info.supported_size_decimals)
+                        price_multiplier = pow(10, market_info.supported_price_decimals)
+                        
+                        client_order_index = int(time.time() * 1000) % 1000000
+                        
+                        # Use actual position amount for retry
+                        actual_base_amount = int(position_amount * base_multiplier)
+                        
+                        # 重试时使用更大的滑点：2%
+                        retry_max_slippage = 0.02
+                        
+                        self.logger.log(
+                            f"🔄 重试平仓(市价限滑点单): 市场={market_id}, 方向={'SELL' if is_ask else 'BUY'}, "
+                            f"数量={position_amount:.8f}, max_slippage=2%",
+                            "INFO"
+                        )
+                        
+                        # Use SDK's create_market_order_limited_slippage for retry
+                        create_order, api_response, error = await self.lighter_client.create_market_order_limited_slippage(
+                            market_index=market_id,
+                            client_order_index=client_order_index,
+                            base_amount=actual_base_amount,
+                            max_slippage=retry_max_slippage,
+                            is_ask=is_ask,
+                            reduce_only=True
+                        )
+                        
+                        # 详细记录重试的API响应
+                        if api_response:
+                            self.logger.log(
+                                f"📡 重试API响应: code={api_response.code}, error={error if error else 'None'}",
+                                "INFO"
+                            )
+                            if hasattr(api_response, 'message') and api_response.message:
+                                self.logger.log(f"   message: {api_response.message}", "INFO")
+                        else:
+                            self.logger.log(f"📡 重试API响应为空, error={error}", "ERROR")
+                        
+                        if error is None and api_response and api_response.code == 200:
+                            retry_closed += 1
+                            self.logger.log(f"✅ 重试订单提交成功", "INFO")
+                        else:
+                            error_code = api_response.code if api_response else 'None'
+                            error_msg = api_response.message if api_response and hasattr(api_response, 'message') else 'No message'
+                            self.logger.log(
+                                f"❌ 重试订单失败: code={error_code}, msg={error_msg}, error={error}",
+                                "ERROR"
+                            )
+                    
+                    if retry_closed > 0:
+                        self.logger.log(f"✅ 重试提交了 {retry_closed} 个平仓订单", "INFO")
+                        self.logger.log("⏳ 等待重试订单成交（最多5秒）...", "INFO")
+                        await asyncio.sleep(5)
+                        
+                        # Re-verify after retry
+                        self.logger.log("🔍 重新验证平仓结果...", "INFO")
+                        verify_positions = await self._fetch_positions_with_retry()
+                        remaining = 0
+                        remaining_positions = []
+                        
+                        for position in verify_positions:
+                            position_amount = abs(float(getattr(position, 'position', 0)))
+                            if position_amount > 0.00001:
+                                remaining += 1
+                                market_id = getattr(position, 'market_id', 'unknown')
+                                # 使用sign字段判断方向
+                                position_sign = getattr(position, 'sign', 1)
+                                remaining_positions.append({
+                                    'market_id': market_id,
+                                    'amount': position_amount,
+                                    'is_ask': position_sign > 0  # sign > 0 = 多头 = 卖出平仓
+                                })
+                                self.logger.log(
+                                    f"⚠️ 重试后仍有持仓: 市场={market_id}, 剩余={position_amount:.8f}",
+                                    "WARNING"
+                                )
+                    else:
+                        # No orders submitted in retry, break retry loop
+                        break
+                
+                # After all retries, check final result
+                if remaining > 0:
+                    self.logger.log(
+                        f"❌ 平仓失败：经过{max_retries}次重试后仍有 {remaining} 个持仓未平掉",
+                        "ERROR"
+                    )
+                    # Return FAILURE to prevent opening new positions
+                    return OrderResult(
+                        success=False,
+                        error_message=f"Failed to close {remaining} positions after {max_retries} retries"
+                    )
+                else:
+                    self.logger.log("✅ 所有持仓已完全平掉", "INFO")
+                    return OrderResult(success=True)
+            else:
+                self.logger.log("ℹ️ 没有需要平仓的持仓", "INFO")
+                return OrderResult(success=True)
+                
+        except Exception as e:
+            self.logger.log(f"❌ 平仓所有持仓异常: {e}", "ERROR")
+            import traceback
+            self.logger.log(f"详细错误: {traceback.format_exc()}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+    
+    async def _get_market_info(self, market_id: int):
+        """Get market information for a given market ID."""
+        try:
+            order_api = lighter.OrderApi(self.api_client)
+            order_books = await order_api.order_books()
+            
+            for market in order_books.order_books:
+                if market.market_id == market_id:
+                    return market
+            
+            return None
+        except Exception as e:
+            self.logger.log(f"获取市场信息失败: {e}", "ERROR")
+            return None
 
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
         """Get order information from Lighter - 优先WebSocket，降级到REST API."""
@@ -639,10 +989,12 @@ class LighterClient(BaseExchangeClient):
                     if position.symbol == self.config.ticker:
                         position_amt = abs(float(position.position))
                         if position_amt > 0.001:
+                            # 使用sign字段判断方向
+                            position_sign = getattr(position, 'sign', 1)
                             # 有持仓，说明订单可能已成交
                             return OrderInfo(
                                 order_id=order_id,
-                                side="buy" if float(position.position) > 0 else "sell",
+                                side="buy" if position_sign > 0 else "sell",
                                 size=Decimal(str(position_amt)),
                                 price=Decimal(str(position.avg_entry_price)),  # ✅ 修复：使用正确的属性名
                                 status="FILLED",
@@ -770,10 +1122,12 @@ class LighterClient(BaseExchangeClient):
                 position_amount = abs(float(getattr(pos, 'position', 0)))
                 if position_amount > 0:
                     market_id = getattr(pos, 'market_id', 'unknown')
+                    # 使用sign字段判断方向
+                    position_sign = getattr(pos, 'sign', 1)
                     # Return position info to indicate there are active positions
                     all_positions.append(OrderInfo(
                         order_id=f"position_{market_id}",
-                        side="long" if float(getattr(pos, 'position', 0)) > 0 else "short",
+                        side="long" if position_sign > 0 else "short",
                         size=Decimal(position_amount),
                         price=Decimal('0'),
                         status="POSITION",

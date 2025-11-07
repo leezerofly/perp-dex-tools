@@ -102,6 +102,46 @@ class BaseExchangeClient(ABC):
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order."""
         pass
+    
+    async def cancel_all_orders(self) -> OrderResult:
+        """Cancel all orders for the account.
+        
+        Returns:
+            OrderResult: Result of the cancellation operation
+        
+        Note: Subclasses should override this method if the exchange supports batch cancel.
+        Default implementation cancels orders one by one.
+        """
+        # Default implementation: cancel all active orders one by one
+        try:
+            active_orders = await self.get_all_active_orders()
+            if len(active_orders) == 0:
+                return OrderResult(success=True)
+            
+            for order in active_orders:
+                if order.status == 'POSITION':
+                    # Skip positions, only cancel orders
+                    continue
+                await self.cancel_order(order.order_id)
+            
+            return OrderResult(success=True)
+        except Exception as e:
+            return OrderResult(success=False, error_message=str(e))
+    
+    async def close_all_positions(self) -> OrderResult:
+        """Close all positions by creating market reduce-only orders.
+        
+        Returns:
+            OrderResult: Result of the close operation
+        
+        Note: Subclasses should override this method based on exchange-specific position closing.
+        Default implementation returns not implemented error.
+        """
+        # Default implementation: not implemented
+        return OrderResult(
+            success=False, 
+            error_message="close_all_positions not implemented for this exchange"
+        )
 
     @abstractmethod
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
