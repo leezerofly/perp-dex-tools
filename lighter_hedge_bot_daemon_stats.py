@@ -86,6 +86,147 @@ def load_group_config(multi_config_file: str, group_name: str):
     raise ValueError(f"未找到组: {group_name}")
 
 
+def calculate_hedge_quantities(balances: List[float], price: float, leverage: float, 
+                               min_usage: float = 0.4, max_usage: float = 0.8) -> dict:
+    """
+    根据三个账户的余额计算对冲开仓数量
+    
+    Args:
+        balances: 三个账户的USDC余额列表 [balance1, balance2, balance3]
+        price: 当前市场价格
+        leverage: 杠杆倍数
+        min_usage: 最小资金使用率（默认40%）
+        max_usage: 最大资金使用率（默认80%）
+    
+    Returns:
+        dict: {
+            'success': bool,
+            'quantities': [qty1, qty2, qty3],  # 三个账户的开仓数量
+            'usage_rates': [rate1, rate2, rate3],  # 资金使用率
+            'error': str  # 如果失败，返回错误信息
+        }
+    """
+    
+    if len(balances) != 3:
+        return {'success': False, 'error': '必须提供3个账户的余额'}
+    
+    if price <= 0:
+        return {'success': False, 'error': '价格必须大于0'}
+    
+    if leverage <= 0:
+        return {'success': False, 'error': '杠杆倍数必须大于0'}
+    
+    if any(b <= 0 for b in balances):
+        return {'success': False, 'error': '所有账户余额必须大于0'}
+    
+    balance1 = balances[0]
+    balance2 = balances[1]
+    balance3 = balances[2]
+    total_hedge_balance = balance2 + balance3
+    
+    # 目标使用率（尽量接近最大值以最大化资金利用）
+    target_usage = max_usage  # 改为直接使用最大值80%
+    
+    # 对于对冲策略：
+    # bot1 做主方向：qty1
+    # bot2 + bot3 做对冲：qty2 + qty3 = qty1
+    #
+    # 关键约束：
+    # 1. usage1 = (qty1 * price) / (balance1 * leverage) 在 [min_usage, max_usage]
+    # 2. usage_hedge = (qty1 * price) / (total_hedge_balance * leverage) 在 [min_usage, max_usage]
+    #
+    # 从约束1：qty1 的范围是 [(min_usage * balance1 * leverage / price), (max_usage * balance1 * leverage / price)]
+    # 从约束2：qty1 的范围是 [(min_usage * total_hedge_balance * leverage / price), (max_usage * total_hedge_balance * leverage / price)]
+    #
+    # 需要找到这两个范围的交集
+    
+    # Bot1的qty1范围
+    qty1_min_from_bot1 = (min_usage * balance1 * leverage) / price
+    qty1_max_from_bot1 = (max_usage * balance1 * leverage) / price
+    
+    # 对冲账户的qty1范围
+    qty1_min_from_hedge = (min_usage * total_hedge_balance * leverage) / price
+    qty1_max_from_hedge = (max_usage * total_hedge_balance * leverage) / price
+    
+    # 取交集
+    qty1_min = max(qty1_min_from_bot1, qty1_min_from_hedge)
+    qty1_max = min(qty1_max_from_bot1, qty1_max_from_hedge)
+    
+    # 检查是否有有效的交集
+    if qty1_min > qty1_max:
+        # 没有交集，计算一下为什么
+        usage1_at_hedge_min = (qty1_min_from_hedge * price) / (balance1 * leverage)
+        usage1_at_hedge_max = (qty1_max_from_hedge * price) / (balance1 * leverage)
+        usage_hedge_at_bot1_min = (qty1_min_from_bot1 * price) / (total_hedge_balance * leverage)
+        usage_hedge_at_bot1_max = (qty1_max_from_bot1 * price) / (total_hedge_balance * leverage)
+        
+        return {
+            'success': False,
+            'error': f'无法找到同时满足所有账户资金使用率要求的数量。Bot1余额={balance1:.2f}, 对冲总余额={total_hedge_balance:.2f}',
+            'details': {
+                'bot1_balance': balance1,
+                'hedge_balance': total_hedge_balance,
+                'balance_ratio': balance1 / total_hedge_balance if total_hedge_balance > 0 else 0
+            }
+        }
+    
+    # 使用最大使用率计算qty1（在有效范围内）
+    # 优先以最大值为目标，最大化资金利用率
+    qty1_target = (target_usage * balance1 * leverage) / price
+    
+    # 确保在有效范围内，优先选择更大的值
+    if qty1_target > qty1_max:
+        qty1 = qty1_max  # 如果目标超过上限，使用上限
+    elif qty1_target < qty1_min:
+        qty1 = qty1_min  # 如果目标低于下限，使用下限
+    else:
+        qty1 = qty1_target  # 使用目标值
+    
+    # 按余额比例分配对冲数量到bot2和bot3
+    qty2 = qty1 * (balance2 / total_hedge_balance)
+    qty3 = qty1 * (balance3 / total_hedge_balance)
+    
+    # 计算实际资金使用率
+    usage1 = (qty1 * price) / (balance1 * leverage)
+    usage2 = (qty2 * price) / (balance2 * leverage)
+    usage3 = (qty3 * price) / (balance3 * leverage)
+    
+    usage_rates = [usage1, usage2, usage3]
+    
+    # 验证所有账户的资金使用率（应该都在范围内，因为我们已经计算了交集）
+    for i, usage in enumerate(usage_rates):
+        if usage < min_usage - 0.001:  # 允许小误差
+            return {
+                'success': False,
+                'error': f'账户{i+1}的资金使用率({usage*100:.2f}%)低于最小值({min_usage*100}%)',
+                'usage_rates': usage_rates
+            }
+        if usage > max_usage + 0.001:  # 允许小误差
+            return {
+                'success': False,
+                'error': f'账户{i+1}的资金使用率({usage*100:.2f}%)超过最大值({max_usage*100}%)',
+                'usage_rates': usage_rates
+            }
+    
+    # 验证对冲关系：qty2 + qty3 应该约等于 qty1
+    hedge_diff = abs((qty2 + qty3) - qty1) / qty1
+    if hedge_diff > 0.01:  # 允许1%的误差
+        return {
+            'success': False,
+            'error': f'对冲数量不匹配：bot1={qty1:.6f}, bot2+bot3={qty2+qty3:.6f}',
+            'quantities': [qty1, qty2, qty3],
+            'usage_rates': usage_rates
+        }
+    
+    return {
+        'success': True,
+        'quantities': [qty1, qty2, qty3],
+        'usage_rates': usage_rates,
+        'balances': balances,
+        'price': price
+    }
+
+
 class DaemonBot:
     """管理单个 runbot_daemon_with_stats.py 守护进程"""
     def __init__(self, bot_id: int, env_file: str, log_file: Optional[Path] = None):
@@ -130,6 +271,50 @@ class DaemonBot:
         except Exception as e:
             print(f"{self.color}✗ {self.env_name}{Colors.RESET} 启动异常: {e}")
             return False
+    
+    def check_balance(self, ticker: str) -> dict:
+        """检查账户余额和市场价格"""
+        if not self.proc or not self.ready:
+            return {'success': False, 'error': 'NOT_READY'}
+        
+        try:
+            cmd = {
+                'action': 'check_balance',
+                'ticker': ticker
+            }
+            
+            self.proc.stdin.write(json.dumps(cmd) + '\n')
+            self.proc.stdin.flush()
+            
+            # 等待响应（最多10秒）
+            start_time = time.time()
+            while time.time() - start_time < 10:
+                line = self.proc.stdout.readline()
+                if not line:
+                    return {'success': False, 'error': 'PIPE_CLOSED'}
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    response = json.loads(line)
+                    
+                    # 跳过日志消息
+                    if response.get('type') == 'log':
+                        continue
+                    
+                    # 返回余额响应
+                    if 'balance' in response or 'error' in response:
+                        return response
+                        
+                except json.JSONDecodeError:
+                    continue
+            
+            return {'success': False, 'error': 'TIMEOUT'}
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def send_trade_command(self, ticker: str, quantity: Decimal, direction: str, 
                           take_profit: Decimal, leverage: Decimal = Decimal('20')) -> bool:
@@ -338,38 +523,108 @@ def main():
         # 随机选择交易对和方向
         item = random.choice(hedge_items)
         ticker = str(item[0]).upper()
-        qty_main = Decimal(str(item[1]))
         profit_pct = Decimal(str(item[2]))
         leverage = Decimal(str(item[3])) if len(item) > 3 else Decimal('20')
         
         direction_main = random.choice(['buy', 'sell'])
         direction_hedge = 'sell' if direction_main == 'buy' else 'buy'
         
-        # 数量分配
-        qty2 = (qty_main / Decimal('2')).quantize(Decimal('0.00000001'))
-        qty3 = (qty_main - qty2).quantize(Decimal('0.00000001'))
-        
         print(f"交易对: {ticker}")
-        print(f"方向: {bots[0].env_name}={direction_main}, {bots[1].env_name}/{bots[2].env_name}={direction_hedge}")
-        print(f"数量: {bots[0].env_name}={qty_main}, {bots[1].env_name}={qty2}, {bots[2].env_name}={qty3}")
+        print(f"主方向: {direction_main}, 对冲方向: {direction_hedge}")
         print(f"杠杆: {leverage}x, 目标收益: {profit_pct}%\n")
         
-        # 发送交易指令
-        print("发送交易指令:")
-        bots[0].send_trade_command(ticker, qty_main, direction_main, profit_pct, leverage)
-        time.sleep(0.2)
-        bots[1].send_trade_command(ticker, qty2, direction_hedge, profit_pct, leverage)
-        time.sleep(0.2)
-        bots[2].send_trade_command(ticker, qty3, direction_hedge, profit_pct, leverage)
+        # ========== 新增：开仓前余额检测 ==========
+        print(f"{Colors.CYAN}正在检测三个账户余额...{Colors.RESET}")
         
-        # 等待所有机器人完成
+        balance_results = []
+        for i, bot in enumerate(bots):
+            result = bot.check_balance(ticker)
+            if not result.get('success'):
+                error_msg = result.get('error', 'UNKNOWN')
+                print(f"{Colors.RED}❌ {bot.env_name} 余额检测失败: {error_msg}{Colors.RESET}")
+                print(f"{Colors.RED}无法继续交易，终止程序！{Colors.RESET}")
+                for b in bots:
+                    b.stop()
+                return 1
+            balance_results.append(result)
+            print(f"  {bot.color}✓ {bot.env_name}{Colors.RESET}: 余额={result['balance']:.2f} USDC")
+        
+        # 获取价格（使用第一个bot返回的价格）
+        current_price = balance_results[0]['price']
+        print(f"\n当前市场价格: {current_price:.4f} USDC")
+        
+        # 提取余额
+        balances = [result['balance'] for result in balance_results]
+        
+        # ========== 新增：动态选择主账户（余额最大的） ==========
+        max_balance_idx = balances.index(max(balances))
+        print(f"{Colors.CYAN}💡 自动选择余额最大的账户作为主账户：{bots[max_balance_idx].env_name} (余额={balances[max_balance_idx]:.2f} USDC){Colors.RESET}\n")
+        
+        # 重新排列账户顺序：主账户放在第一位
+        # 创建新的排序：主账户在第一位，其他两个账户在后面
+        sorted_indices = [max_balance_idx]
+        for i in range(3):
+            if i != max_balance_idx:
+                sorted_indices.append(i)
+        
+        # 重新排列 bots 和 balances
+        bots_sorted = [bots[i] for i in sorted_indices]
+        balances_sorted = [balances[i] for i in sorted_indices]
+        
+        # 计算动态开仓数量（使用排序后的余额）
+        print(f"{Colors.CYAN}计算对冲开仓数量...{Colors.RESET}")
+        calc_result = calculate_hedge_quantities(
+            balances=balances_sorted,
+            price=current_price,
+            leverage=float(leverage),
+            min_usage=0.4,
+            max_usage=0.8
+        )
+        
+        if not calc_result['success']:
+            error_msg = calc_result.get('error', 'UNKNOWN')
+            print(f"{Colors.RED}❌ 计算开仓数量失败: {error_msg}{Colors.RESET}")
+            if 'usage_rates' in calc_result:
+                usage_rates = calc_result['usage_rates']
+                for i, rate in enumerate(usage_rates):
+                    print(f"  账户{i+1} ({bots_sorted[i].env_name}): 资金使用率={rate*100:.2f}%")
+            print(f"{Colors.RED}不满足开仓条件，终止程序！{Colors.RESET}")
+            for bot in bots:
+                bot.stop()
+            return 1
+        
+        # 获取计算出的数量
+        quantities = calc_result['quantities']
+        usage_rates = calc_result['usage_rates']
+        
+        qty_main = Decimal(str(quantities[0])).quantize(Decimal('0.00000001'))
+        qty2 = Decimal(str(quantities[1])).quantize(Decimal('0.00000001'))
+        qty3 = Decimal(str(quantities[2])).quantize(Decimal('0.00000001'))
+        
+        # 打印开仓计划（使用排序后的顺序）
+        print(f"{Colors.GREEN}✓ 开仓数量计算成功：{Colors.RESET}")
+        print(f"  {bots_sorted[0].color}{bots_sorted[0].env_name} (主账户){Colors.RESET}: {direction_main} {qty_main} (资金使用率: {usage_rates[0]*100:.2f}%)")
+        print(f"  {bots_sorted[1].color}{bots_sorted[1].env_name} (对冲){Colors.RESET}: {direction_hedge} {qty2} (资金使用率: {usage_rates[1]*100:.2f}%)")
+        print(f"  {bots_sorted[2].color}{bots_sorted[2].env_name} (对冲){Colors.RESET}: {direction_hedge} {qty3} (资金使用率: {usage_rates[2]*100:.2f}%)")
+        print(f"  对冲验证: {qty_main} vs {qty2 + qty3} = {abs(qty_main - (qty2 + qty3)):.8f} (差值)")
+        print()
+        
+        # 发送交易指令（使用排序后的顺序）
+        print("发送交易指令:")
+        bots_sorted[0].send_trade_command(ticker, qty_main, direction_main, profit_pct, leverage)
+        time.sleep(0.2)
+        bots_sorted[1].send_trade_command(ticker, qty2, direction_hedge, profit_pct, leverage)
+        time.sleep(0.2)
+        bots_sorted[2].send_trade_command(ticker, qty3, direction_hedge, profit_pct, leverage)
+        
+        # 等待所有机器人完成（使用排序后的顺序）
         print("\n等待所有交易完成...")
         
         import threading
         results = [None, None, None]
         
         def wait_bot(idx):
-            results[idx] = bots[idx].wait_for_completion(timeout=7500)
+            results[idx] = bots_sorted[idx].wait_for_completion(timeout=7500)
         
         threads = []
         for i in range(3):
@@ -385,7 +640,7 @@ def main():
         for idx, result in enumerate(results):
             if result and result.get('error') == 'TIMEOUT':
                 timeout_detected = True
-                env_name = result.get('env_name', bots[idx].env_name)
+                env_name = result.get('env_name', bots_sorted[idx].env_name)
                 print(f"\n❌ {env_name} 止盈止损等待超时，停止整个程序！\n")
                 break
         
@@ -400,9 +655,14 @@ def main():
         success_count = sum(1 for r in results if r and r.get('success'))
         print(f"\n本轮结果: {success_count}/3 成功\n")
         
-        # 收集统计数据
+        # 收集统计数据（需要恢复原始顺序以正确记录）
         if success_count == 3:
-            bot_stats = [r.get('stats', {}) for r in results]
+            # 将结果按原始bot顺序重新排列
+            results_original_order = [None, None, None]
+            for i, sorted_idx in enumerate(sorted_indices):
+                results_original_order[sorted_idx] = results[i]
+            
+            bot_stats = [r.get('stats', {}) for r in results_original_order]
             stats_collector.add_round_stats(round_idx + 1, ticker, bot_stats)
             print(f"📊 统计数据已记录到: {stats_collector.stats_file}")
         

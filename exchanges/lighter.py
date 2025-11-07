@@ -813,6 +813,45 @@ class LighterClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    async def get_account_balance(self) -> Decimal:
+        """Get account USDC balance using official SDK."""
+        try:
+            # Use shared API client
+            account_api = lighter.AccountApi(self.api_client)
+
+            # Get account info
+            account_data = await account_api.account(by="index", value=str(self.account_index))
+
+            if not account_data or not account_data.accounts:
+                self.logger.log("Failed to get account balance", "ERROR")
+                raise ValueError("Failed to get account balance")
+
+            # Get account info
+            account_info = account_data.accounts[0]
+            
+            # Debug: 打印账户对象的所有属性
+            self.logger.log(f"账户对象属性: {dir(account_info)}", "DEBUG")
+            self.logger.log(f"账户对象类型: {type(account_info)}", "DEBUG")
+            
+            # 尝试不同的可能属性名
+            balance = None
+            possible_attrs = ['free_collateral', 'available_balance', 'balance', 'free_balance', 
+                            'collateral', 'equity', 'total_collateral', 'wallet_balance']
+            
+            for attr in possible_attrs:
+                if hasattr(account_info, attr):
+                    balance = Decimal(str(getattr(account_info, attr)))
+                    self.logger.log(f"找到余额属性 '{attr}': {balance} USDC", "INFO")
+                    return balance
+            
+            # 如果没找到，打印对象的字符串表示
+            self.logger.log(f"账户对象内容: {account_info}", "DEBUG")
+            raise ValueError(f"无法找到余额属性。可用属性: {[a for a in dir(account_info) if not a.startswith('_')]}")
+
+        except Exception as e:
+            self.logger.log(f"获取账户余额失败: {e}", "ERROR")
+            raise
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
         ticker = self.config.ticker

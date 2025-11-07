@@ -22,6 +22,59 @@ def log_output(message: str):
     print(json.dumps({"type": "log", "message": message}, ensure_ascii=False), flush=True)
 
 
+async def get_account_balance(env_file: str, ticker: str) -> dict:
+    """获取账户余额和市场价格"""
+    from dotenv import load_dotenv
+    load_dotenv(env_file, override=True)
+    
+    config = TradingConfig(
+        ticker=ticker,
+        contract_id='',
+        tick_size=Decimal(0),
+        quantity=Decimal(1),
+        take_profit=Decimal(1),
+        direction='buy',
+        max_orders=1,
+        wait_time=0,
+        exchange='lighter',
+        grid_step=Decimal(0),
+        stop_price=Decimal(0),
+        pause_price=Decimal(0),
+        boost_mode=False,
+        tp_sl_only=True,
+        leverage=Decimal('20')
+    )
+    
+    bot = TradingBot(config)
+    
+    try:
+        # 初始化
+        config.contract_id, config.tick_size = await bot.exchange_client.get_contract_attributes()
+        await bot.exchange_client.connect()
+        await asyncio.sleep(2)
+        
+        # 获取余额
+        balance = await bot.exchange_client.get_account_balance()
+        
+        # 获取当前价格
+        best_bid, best_ask = await bot.exchange_client.fetch_bbo_prices(config.contract_id)
+        mid_price = (best_bid + best_ask) / 2
+        
+        return {
+            'success': True,
+            'balance': float(balance),
+            'price': float(mid_price),
+            'ticker': ticker
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+    finally:
+        await bot.exchange_client.disconnect()
+
+
 async def get_position_stats(bot, config):
     """获取持仓统计信息"""
     try:
@@ -250,6 +303,12 @@ async def daemon_mode(env_file: str):
                 
                 # 执行交易
                 result = await execute_single_trade(config)
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                
+            elif cmd.get('action') == 'check_balance':
+                # 检查余额和价格
+                ticker = cmd.get('ticker', '')
+                result = await get_account_balance(env_file, ticker)
                 print(json.dumps(result, ensure_ascii=False), flush=True)
                 
             elif cmd.get('action') == 'exit':
