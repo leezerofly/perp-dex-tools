@@ -1,54 +1,54 @@
 {
-  "groups": [
-    {
-        "name": "A",
-        "enabled": true,
-        "accounts": {
-            "bot1": "envs/1.env",
-            "bot2": "envs/2.env",
-            "bot3": "envs/3.env"
+    "groups": [
+        {
+            "name": "A",
+            "enabled": true,
+            "accounts": {
+                "bot1": "envs/3.env",
+                "bot2": "envs/2.env",
+                "bot3": "envs/1.env"
+            },
+            "trading_pairs": [
+                ["MET", 1000, 8, 5],
+                ["PAXG", 0.1, 2, 8]
+            ],
+            "rounds": 2000,
+            "log_prefix": "groupA"
         },
-        "trading_pairs": [
-            ["MET", 100, 5, 5],
-            ["PAXG", 0.05, 1, 8]
-        ],
-        "rounds": 2000,
-        "log_prefix": "groupA"
-    },
-    {
-        "name": "B",
-        "enabled": true,
-        "accounts": {
-            "bot1": "envs/4.env",
-            "bot2": "envs/5.env",
-            "bot3": "envs/6.env"
+        {
+            "name": "B",
+            "enabled": true,
+            "accounts": {
+                "bot1": "envs/4.env",
+                "bot2": "envs/5.env",
+                "bot3": "envs/6.env"
+            },
+            "trading_pairs": [
+                ["MET", 3600, 8, 5],
+                ["PAXG", 0.6, 2, 8]
+            ],
+            "rounds": 2000,
+            "log_prefix": "groupB"
         },
-        "trading_pairs": [
-            ["MET", 100, 1, 5],
-            ["PAXG", 0.05, 1, 8]
-        ],
-        "rounds": 2000,
-        "log_prefix": "groupB"
-    },
-    {
-        "name": "C",
-        "enabled": false,
-        "accounts": {
-            "bot1": "envs/7.env",
-            "bot2": "envs/8.env",
-            "bot3": "envs/9.env"
-        },
-        "trading_pairs": [
-            ["SOL", 1, 3, 6]
-        ],
-        "rounds": 2000,
-        "log_prefix": "groupC"
+        {
+            "name": "C",
+            "enabled": false,
+            "accounts": {
+                "bot1": "envs/7.env",
+                "bot2": "envs/8.env",
+                "bot3": "envs/9.env"
+            },
+            "trading_pairs": [
+                ["SOL", 1, 3, 6]
+            ],
+            "rounds": 2000,
+            "log_prefix": "groupC"
         }
     ],
     "global": {
         "log_dir": "./logs",
         "min_wait_seconds": 30,
         "max_wait_seconds": 60
-  }
+    }
 }
 

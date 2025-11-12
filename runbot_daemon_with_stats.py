@@ -306,7 +306,7 @@ async def execute_single_trade(config: TradingConfig):
         
         # 等待止盈/止损
         log_output("等待止盈或止损触发...")
-        max_wait = 7200  # 最多等待2小时
+        max_wait = 7200 * 2  # 最多等待4小时
         start_time = asyncio.get_event_loop().time()
         
         last_status_log_time = start_time
