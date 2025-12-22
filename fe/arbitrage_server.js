@@ -83,8 +83,8 @@ function createSession(sessionId) {
         },
         
         config: {
-            symbol: 'XRP/USDT',
-            orderSize: 100,
+            symbol: 'BTC/USDT',
+            orderSize: 0.003,
             
             // === 收益阈值 (GRVT双Maker策略) ===
             // 总成本 = VAR点差(~0.05%) - GRVT双返佣(0.002%) ≈ 0.048%
@@ -96,7 +96,7 @@ function createSession(sessionId) {
             grvtTakerFee: 0.00037,       // 0.037% taker费用 (备用)
             
             // === 订单超时设置 ===
-            orderTimeout: 5000,          // 限价单超时(ms)，超时后取消重挂
+            orderTimeout: 30000,          // 限价单超时(ms)，超时后取消重挂
             maxRetries: 10,              // 最大重试次数
             retryDelay: 500,             // 重试间隔(ms)
             priceOffset: 0.0001          // 重挂时价格偏移(更激进)
