@@ -229,6 +229,7 @@
         .btn-start { background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%); color: #000; }
         .btn-stop { background: linear-gradient(135deg, #ff4466 0%, #cc2244 100%); color: #fff; }
         .btn-close { background: linear-gradient(135deg, #ffaa00 0%, #cc8800 100%); color: #000; }
+        .btn-test { background: linear-gradient(135deg, #9c27b0 0%, #7b1fa2 100%); color: #fff; }
         .btn-delete { background: rgba(255,255,255,0.1); color: #ff4466; font-size: 10px; padding: 5px 10px; }
         
         .empty-state {
@@ -547,19 +548,24 @@
                             ` : ''}
                             
                             <div class="btn-group">
-                                <button class="btn-start" 
-                                    onclick="startSession('${id}')" 
+                                <button class="btn-start"
+                                    onclick="startSession('${id}')"
                                     ${!bothConnected || s.isRunning ? 'disabled' : ''}>
                                     启动
                                 </button>
-                                <button class="btn-stop" 
+                                <button class="btn-stop"
                                     onclick="stopSession('${id}')"
                                     ${!s.isRunning ? 'disabled' : ''}>
                                     停止
                                 </button>
-                                <button class="btn-close" 
+                                <button class="btn-close"
                                     onclick="closeSession('${id}')">
                                     平仓
+                                </button>
+                                <button class="btn-test"
+                                    onclick="testGrvtStatus('${id}')"
+                                    ${!bothConnected ? 'disabled' : ''}>
+                                    测试状态
                                 </button>
                             </div>
                         </div>
@@ -599,6 +605,15 @@
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'EMERGENCY_CLOSE', sessionId }));
                 log('🚨 发送紧急平仓指令', 'warning', sessionId);
+            }
+        }
+
+        function testGrvtStatus(sessionId) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'CHECK_GRVT_STATUS', sessionId }));
+                log('🧪 发送GRVT状态检查请求', 'info', sessionId);
+            } else {
+                log('❌ WebSocket未连接', 'error');
             }
         }
         

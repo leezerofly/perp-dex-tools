@@ -122,6 +122,22 @@
                     log('⚠️ VAR客户端断开连接', 'warning');
                 }
                 break;
+
+            case 'REPORT_STATUS':
+                // 报告当前GRVT状态
+                const status = {
+                    hasPosition: hasPosition(),
+                    hasPendingOrders: hasPendingOrders(),
+                    positionInfo: getCurrentPosition()
+                };
+                ws.send(JSON.stringify({
+                    type: 'GRVT_STATUS_REPORT',
+                    sessionId: SESSION_ID,
+                    source: 'grvt',
+                    ...status
+                }));
+                log(`状态报告: 仓位=${status.hasPosition}, 未完成订单=${status.hasPendingOrders}`, 'info');
+                break;
         }
     }
     
@@ -154,35 +170,66 @@
         }
     }
     
+    // 解析带逗号分隔符的数字，如 "89,356.12" -> 89356.12
+    function parseNumber(str) {
+        if (!str) return NaN;
+        // 移除所有逗号后解析
+        return parseFloat(str.replace(/,/g, ''));
+    }
+    
     function getBestPrices() {
         let bestBid = null;
         let bestAsk = null;
         
-        // 从orderbook获取
-        const orderBookRows = document.querySelectorAll('[data-sentry-component="OrderBook"] .fx-center-between');
+        // 方法1: 从订单簿行获取 (BackgroundProgress 组件)
+        const orderBookRows = document.querySelectorAll('[data-sentry-component="BackgroundProgress"]');
         orderBookRows.forEach(row => {
-            const priceEl = row.querySelector('.heading-12');
+            // 价格在第一个 fx-1 元素中
+            const priceEl = row.querySelector('.fx-1.py-1');
             if (priceEl) {
-                const price = parseFloat(priceEl.textContent);
+                const price = parseNumber(priceEl.textContent);
                 if (!isNaN(price)) {
-                    if (row.querySelector('.txt-feature-green')) {
+                    // 判断是买单(绿色)还是卖单(红色)
+                    if (priceEl.classList.contains('txt-feature-green')) {
+                        // 买单 - 取最高价
                         if (!bestBid || price > bestBid) bestBid = price;
-                    } else if (row.querySelector('.txt-feature-red')) {
+                    } else if (priceEl.classList.contains('txt-feature-red')) {
+                        // 卖单 - 取最低价
                         if (!bestAsk || price < bestAsk) bestAsk = price;
                     }
                 }
             }
         });
         
-        // 从标题获取
+        // 方法2: 从中间价格区域获取 (heading-16 的绿色大数字)
         if (!bestBid || !bestAsk) {
-            const titleMatch = document.title.match(/([\d.]+)\s*\|/);
+            const midPriceEl = document.querySelector('.txt-feature-green .heading-16, .heading-16.txt-feature-green, .fx.txt-feature-green .heading-16');
+            if (midPriceEl) {
+                const midPrice = parseNumber(midPriceEl.textContent);
+                if (!isNaN(midPrice)) {
+                    // 用中间价估算 bid/ask
+                    const tickSize = 0.0001;
+                    if (!bestBid) bestBid = midPrice;
+                    if (!bestAsk) bestAsk = midPrice + tickSize;
+                }
+            }
+        }
+        
+        // 方法3: 从标题获取
+        if (!bestBid || !bestAsk) {
+            const titleMatch = document.title.match(/([\d.,]+)\s*\|/);
             if (titleMatch) {
-                const midPrice = parseFloat(titleMatch[1]);
+                const midPrice = parseNumber(titleMatch[1]);
                 const tickSize = 0.0001;
                 bestBid = bestBid || midPrice - tickSize;
                 bestAsk = bestAsk || midPrice + tickSize;
             }
+        }
+        
+        // 调试日志 (首次获取时输出)
+        if (bestBid && bestAsk && !window._grvtPriceLogged) {
+            log(`价格获取成功: Bid=${bestBid}, Ask=${bestAsk}`, 'success');
+            window._grvtPriceLogged = true;
         }
         
         return { bid: bestBid, ask: bestAsk };
@@ -219,31 +266,86 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
     
+    // 从订单簿获取最佳价格并点击对应行
+    // Maker单逻辑：挂在自己方的最优价，等待对方来吃
+    function clickOrderBookPrice(side) {
+        const orderBookRows = document.querySelectorAll('[data-sentry-component="BackgroundProgress"]');
+        let targetRow = null;
+        let targetPrice = null;
+        
+        if (side === 'buy') {
+            // 买入Maker：点击买单(绿色)的最高价，挂单等待卖方来成交
+            let highestBid = 0;
+            orderBookRows.forEach(row => {
+                const priceEl = row.querySelector('.fx-1.py-1.txt-feature-green');
+                if (priceEl) {
+                    const price = parseNumber(priceEl.textContent);
+                    if (!isNaN(price) && price > highestBid) {
+                        highestBid = price;
+                        targetRow = row;
+                        targetPrice = price;
+                    }
+                }
+            });
+        } else {
+            // 卖出Maker：点击卖单(红色)的最低价，挂单等待买方来成交
+            let lowestAsk = Infinity;
+            orderBookRows.forEach(row => {
+                const priceEl = row.querySelector('.fx-1.py-1.txt-feature-red');
+                if (priceEl) {
+                    const price = parseNumber(priceEl.textContent);
+                    if (!isNaN(price) && price < lowestAsk) {
+                        lowestAsk = price;
+                        targetRow = row;
+                        targetPrice = price;
+                    }
+                }
+            });
+        }
+        
+        if (targetRow && targetPrice) {
+            targetRow.click();
+            log(`点击订单簿价格: ${targetPrice} (${side === 'buy' ? '买单最高价' : '卖单最低价'})`, 'info');
+            return targetPrice;
+        }
+        
+        return null;
+    }
+    
     async function placeLimitOrder(side, price, quantity, orderType = 'open') {
-        log(`执行限价单: ${side} @ ${price}, 数量: ${quantity}`, 'trade');
+        log(`执行限价单: ${side}, 数量: ${quantity}`, 'trade');
         
         try {
-            // 1. 切换到限价单
+            // 1. 切换到限价单模式
             const limitTab = document.querySelector('[data-text="限价"]');
             if (limitTab) {
                 limitTab.click();
-                await sleep(150);
-            }
-            
-            // 2. 输入价格
-            const priceInput = document.querySelector('input[placeholder="价格"]');
-            if (priceInput) {
-                priceInput.focus();
-                simulateInput(priceInput, price.toString());
                 await sleep(100);
             }
+            
+            // 2. 点击订单簿获取价格（比输入更快更准确）
+            const actualPrice = clickOrderBookPrice(side);
+            if (!actualPrice) {
+                log('无法从订单簿获取价格，使用传入价格', 'warning');
+                // 降级：使用输入框输入价格
+                const priceInput = document.querySelector('input[placeholder="价格"]');
+                if (priceInput) {
+                    priceInput.focus();
+                    simulateInput(priceInput, price.toString());
+                    await sleep(50);
+                }
+            }
+            await sleep(50);
+            
+            // 使用实际价格（点击获取的或传入的）
+            const finalPrice = actualPrice || price;
             
             // 3. 输入数量
             const qtyInput = document.querySelector('input[placeholder="数量"]');
             if (qtyInput) {
                 qtyInput.focus();
                 simulateInput(qtyInput, quantity.toString());
-                await sleep(100);
+                await sleep(50);
             }
             
             // 4. 勾选只做maker
@@ -253,7 +355,7 @@
                     const input = cb.querySelector('input[type="checkbox"]');
                     if (input && !input.checked) {
                         cb.click();
-                        await sleep(50);
+                        await sleep(30);
                     }
                     break;
                 }
@@ -268,30 +370,30 @@
                     (side === 'sell' && text.includes('卖出'))) {
                     btn.click();
                     buttonClicked = true;
-                    log(`${side === 'buy' ? '买入' : '卖出'}限价单已提交`, 'success');
+                    log(`${side === 'buy' ? '买入' : '卖出'}限价单已提交 @ ${finalPrice}`, 'success');
                     
-                    // 通知服务器订单已挂出
+                    // 通知服务器订单已挂出（使用实际价格）
                     ws.send(JSON.stringify({
                         type: 'ORDER_PLACED',
                         sessionId: SESSION_ID,
                         source: 'grvt',
                         orderType: orderType,
                         side: side,
-                        price: price,
+                        price: finalPrice,  // 使用实际点击的价格
                         quantity: quantity
                     }));
                     
                     currentOrder.status = 'active';
+                    currentOrder.price = finalPrice;
                     
                     // 开始监控订单成交
-                    monitorOrderFill(price, quantity, orderType);
+                    monitorOrderFill(finalPrice, quantity, orderType);
                     return true;
                 }
             }
             
             if (!buttonClicked) {
                 log('未找到下单按钮', 'error');
-                // 通知服务器下单失败
                 ws.send(JSON.stringify({
                     type: 'ORDER_FAILED',
                     sessionId: SESSION_ID,
@@ -303,7 +405,6 @@
             }
         } catch (e) {
             log(`下单失败: ${e.message}`, 'error');
-            // 通知服务器下单失败
             ws.send(JSON.stringify({
                 type: 'ORDER_FAILED',
                 sessionId: SESSION_ID,
@@ -350,35 +451,39 @@
         }
     }
     
+    // ============================================
+    // 订单和仓位检测
+    // ============================================
+
     let orderMonitorInterval = null;
     function monitorOrderFill(targetPrice, quantity, orderType = 'open') {
         if (orderMonitorInterval) clearInterval(orderMonitorInterval);
-        
+
         let lastPendingCount = getPendingOrderCount();
         let checkCount = 0;
         const startTime = Date.now();
-        
+
         log(`开始监控${orderType === 'open' ? '开仓' : '平仓'}订单成交...`, 'info');
-        
+
         orderMonitorInterval = setInterval(() => {
             checkCount++;
-            
+
             // 如果订单已被取消，停止监控
             if (currentOrder.status === 'cancelled') {
                 log('订单已取消，停止监控', 'warning');
                 clearInterval(orderMonitorInterval);
                 return;
             }
-            
+
             const currentCount = getPendingOrderCount();
-            
+
             // 检测订单成交 (待成交数量减少)
             if (currentCount < lastPendingCount) {
                 log(`🎉 ${orderType === 'open' ? '开仓' : '平仓'}限价单已成交!`, 'success');
                 clearInterval(orderMonitorInterval);
-                
+
                 currentOrder.status = 'filled';
-                
+
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
                         type: 'ORDER_FILLED',
@@ -391,15 +496,15 @@
                 }
                 return;
             }
-            
+
             lastPendingCount = currentCount;
-            
+
             // 每秒输出一次状态
             if (checkCount % 10 === 0) {
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 log(`等待成交中... ${elapsed}s (待成交订单数: ${currentCount})`, 'info');
             }
-            
+
             // 60秒超时(由服务器控制实际超时，这里只是监控上限)
             if (checkCount > 600) {
                 log('订单监控超时(60s)', 'warning');
@@ -407,14 +512,143 @@
             }
         }, 100);
     }
-    
+
+    // 获取未成交订单数量
     function getPendingOrderCount() {
+        // 从标签文本提取数字: "未成交订单（ 1 ）"
         const tab = document.querySelector('[data-text*="未成交订单"]');
         if (tab) {
-            const match = tab.textContent.match(/\d+/);
-            return match ? parseInt(match[0]) : 0;
+            const match = tab.textContent.match(/（ (\d+) ）/);
+            return match ? parseInt(match[1]) : 0;
         }
         return 0;
+    }
+
+    // 获取当前仓位数量
+    function getPositionCount() {
+        // 从标签文本提取数字: "仓位（ 1 ）"
+        const tab = document.querySelector('[data-text*="仓位"]');
+        if (tab) {
+            const match = tab.textContent.match(/（ (\d+) ）/);
+            return match ? parseInt(match[1]) : 0;
+        }
+        return 0;
+    }
+
+    // 获取当前仓位信息
+    function getCurrentPosition() {
+        const positionCount = getPositionCount();
+        if (positionCount === 0) return null;
+
+        try {
+            // 点击仓位标签页切换到仓位视图
+            const positionTab = document.querySelector('[data-text*="仓位"]');
+            if (positionTab && !positionTab.classList.contains('style_active__ex4rC')) {
+                positionTab.click();
+                // 等待切换完成
+                sleep(300);
+            }
+
+            // 查找仓位表格行
+            const positionRows = document.querySelectorAll('.style_tableRow__gbjWO, [data-sentry-component*="TableRow"]');
+            if (positionRows.length > 0) {
+                const firstRow = positionRows[0];
+
+                // 尝试提取仓位信息
+                let side = 'unknown';
+                let size = 0;
+                let entryPrice = 0;
+                let pnl = 0;
+                let symbol = '';
+
+                // 从行中提取数据
+                const cells = firstRow.querySelectorAll('[data-sentry-element="TableCell"], .heading-12, .body-12, [data-sentry-component*="Cell"]');
+                log(`找到 ${cells.length} 个仓位单元格`, 'info');
+
+                cells.forEach((cell, index) => {
+                    const text = cell.textContent.trim();
+                    log(`仓位单元格 ${index}: "${text}"`, 'info');
+
+                    // 判断多空方向 - 从单元格内容判断
+                    if (text.includes('做多') || text.includes('Long') || text.includes('Buy') || text.includes('买入')) {
+                        side = 'long';
+                    } else if (text.includes('做空') || text.includes('Short') || text.includes('Sell') || text.includes('卖出')) {
+                        side = 'short';
+                    }
+
+                    // 提取数值
+                    const numMatch = text.match(/[\d,]+\.?\d*/);
+                    if (numMatch) {
+                        const num = parseNumber(numMatch[0]);
+
+                        // 根据内容类型判断字段
+                        if (text.includes('XRP') || text.includes('USDT')) {
+                            symbol = text; // 交易对
+                        } else if (text.includes('.') && num > 0 && num < 100000 && entryPrice === 0) {
+                            entryPrice = num; // 开仓价格
+                        } else if (text.includes('.') && Math.abs(num) < 10000 && pnl === 0) {
+                            pnl = num; // 盈亏
+                        } else if (!text.includes('.') && num > 0 && size === 0) {
+                            size = num; // 仓位大小
+                        }
+                    }
+                });
+
+                // 如果没找到明确的指标，尝试从单元格位置推断
+                if (entryPrice === 0 || size === 0) {
+                    cells.forEach((cell, index) => {
+                        const text = cell.textContent.trim();
+                        const numMatch = text.match(/[\d,]+\.?\d*/);
+
+                        if (numMatch) {
+                            const num = parseNumber(numMatch[0]);
+                            // 通常结构: [交易对, 方向, 大小, 开仓价, 标记价, 强平价, 盈亏, ...]
+                            if (index === 3 && entryPrice === 0) {
+                                entryPrice = num;
+                            } else if (index === 4 && size === 0 && num < 1000) {
+                                size = num;
+                            } else if (index >= 6 && pnl === 0 && Math.abs(num) < 1000) {
+                                pnl = num;
+                            }
+                        }
+                    });
+                }
+
+                const result = {
+                    side,
+                    size,
+                    entryPrice,
+                    pnl,
+                    symbol
+                };
+
+                log(`解析仓位信息: 方向=${side}, 大小=${size}, 开仓价=${entryPrice}, 盈亏=${pnl}`, 'info');
+                return result;
+            } else {
+                log('未找到仓位表格行', 'warning');
+            }
+        } catch (e) {
+            log(`获取仓位信息失败: ${e.message}`, 'warning');
+        }
+
+        // 如果无法获取详细信息，返回基本信息
+        return {
+            side: 'unknown',
+            size: 0,
+            entryPrice: 0,
+            pnl: 0,
+            symbol: ''
+        };
+    }
+
+    // 检查是否有未完成的订单
+    function hasPendingOrders() {
+        return getPendingOrderCount() > 0;
+    }
+
+    // 检查是否有仓位
+    function hasPosition() {
+        return getPositionCount() > 0;
     }
     
     function createStatusPanel() {

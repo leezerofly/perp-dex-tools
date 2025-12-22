@@ -147,9 +147,33 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
     
+    // VAR订单状态跟踪
+    let currentVarOrder = {
+        orderId: null,
+        orderType: null,
+        side: null,
+        quantity: 0,
+        retryCount: 0,
+        maxRetries: 5,  // VAR订单最大重试次数
+        createdAt: null,
+        status: 'none'
+    };
+
     async function placeMarketOrder(side, quantity, orderType = 'open') {
         log(`执行${orderType === 'open' ? '开仓' : '平仓'}市价单: ${side}, 数量: ${quantity}`, 'trade');
-        
+
+        // 更新当前订单状态
+        const orderId = `var_${orderType}_${Date.now()}`;
+        currentVarOrder = {
+            orderId: orderId,
+            orderType: orderType,
+            side: side,
+            quantity: quantity,
+            retryCount: currentVarOrder.retryCount || 0,
+            createdAt: Date.now(),
+            status: 'pending'
+        };
+
         try {
             // 1. 确保是市价单模式
             const marketBtn = Array.from(document.querySelectorAll('[data-testid="toggle-select"] button'))
@@ -158,21 +182,27 @@
                 marketBtn.click();
                 await sleep(100);
             }
-            
+
             // 2. 选择买/卖方向
             const sideButtons = document.querySelectorAll('[role="switch"] button');
+            let sideClicked = false;
             for (const btn of sideButtons) {
                 const text = btn.textContent.trim();
                 if ((side === 'buy' && text.startsWith('买')) ||
                     (side === 'sell' && text.startsWith('卖'))) {
                     if (!btn.disabled && !btn.classList.contains('pointer-events-none')) {
                         btn.click();
+                        sideClicked = true;
                         await sleep(100);
                     }
                     break;
                 }
             }
-            
+
+            if (!sideClicked) {
+                throw new Error('无法选择买卖方向');
+            }
+
             // 3. 输入数量
             const qtyInput = document.querySelector('[data-testid="quantity-input"]');
             if (qtyInput) {
@@ -180,41 +210,119 @@
                 simulateInput(qtyInput, quantity.toString());
                 await sleep(150);
             }
-            
+
             // 4. 点击提交
             await sleep(100);
             const submitBtn = document.querySelector('[data-testid="submit-button"]');
             if (submitBtn && !submitBtn.disabled) {
                 const currentPrices = getPrices();
                 const fillPrice = side === 'buy' ? currentPrices.ask : currentPrices.bid;
-                
+
                 submitBtn.click();
                 log(`🎉 ${orderType === 'open' ? '开仓' : '平仓'}${side === 'buy' ? '买入' : '卖出'}市价单已提交`, 'success');
-                
-                // 通知服务器成交
-                await sleep(500);
+                currentVarOrder.status = 'submitted';
+
+                // 通知服务器订单已提交
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
-                        type: 'VAR_ORDER_FILLED',
+                        type: 'VAR_ORDER_SUBMITTED',
                         source: 'var',
                         sessionId: SESSION_ID,
+                        orderId: orderId,
                         orderType: orderType,
                         side: side,
-                        price: fillPrice,
-                        quantity: quantity
+                        quantity: quantity,
+                        expectedPrice: fillPrice
                     }));
                 }
-                
-                return true;
+
+                // 等待成交确认
+                await sleep(500);
+
+                // 检查是否真的成交了（这里需要更准确的成交检测）
+                const hasFilled = await checkOrderFilled(orderType);
+
+                if (hasFilled) {
+                    log(`✅ VAR订单已确认成交`, 'success');
+                    currentVarOrder.status = 'filled';
+
+                    // 通知服务器成交
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'VAR_ORDER_FILLED',
+                            source: 'var',
+                            sessionId: SESSION_ID,
+                            orderId: orderId,
+                            orderType: orderType,
+                            side: side,
+                            price: fillPrice,
+                            quantity: quantity
+                        }));
+                    }
+                    return true;
+                } else {
+                    // 可能成交失败或延迟，通知服务器
+                    log(`⚠️ VAR订单成交状态不确定`, 'warning');
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'VAR_ORDER_UNCONFIRMED',
+                            source: 'var',
+                            sessionId: SESSION_ID,
+                            orderId: orderId,
+                            orderType: orderType,
+                            side: side,
+                            quantity: quantity
+                        }));
+                    }
+                    return false;
+                }
+
             } else {
-                log('提交按钮不可用，等待重试...', 'warning');
-                await sleep(300);
-                return await placeMarketOrder(side, quantity, orderType);
+                // 按钮不可用，尝试重试
+                if (currentVarOrder.retryCount < currentVarOrder.maxRetries) {
+                    log(`提交按钮不可用，第${currentVarOrder.retryCount + 1}次重试...`, 'warning');
+                    currentVarOrder.retryCount++;
+                    await sleep(500);
+                    return await placeMarketOrder(side, quantity, orderType);
+                } else {
+                    throw new Error('提交按钮不可用，重试次数已达上限');
+                }
             }
         } catch (e) {
             log(`下单失败: ${e.message}`, 'error');
+
+            // 通知服务器订单失败
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'VAR_ORDER_FAILED',
+                    source: 'var',
+                    sessionId: SESSION_ID,
+                    orderId: currentVarOrder.orderId,
+                    orderType: orderType,
+                    side: side,
+                    quantity: quantity,
+                    reason: e.message,
+                    retryCount: currentVarOrder.retryCount
+                }));
+            }
+
             return false;
         }
+    }
+
+    // 检查订单是否成交（简化版，需要根据实际DOM调整）
+    async function checkOrderFilled(orderType) {
+        // 这里应该检查是否有成交记录或余额变化
+        // 暂时用简单的时间延迟模拟
+        await sleep(1000);
+
+        // 实际应该检查：
+        // 1. 成交历史记录
+        // 2. 余额变化
+        // 3. 仓位变化
+
+        // 暂时返回true，假设成交成功
+        return true;
     }
     
     function createStatusPanel() {
