@@ -190,11 +190,9 @@
                 const text = btn.textContent.trim();
                 if ((side === 'buy' && text.startsWith('买')) ||
                     (side === 'sell' && text.startsWith('卖'))) {
-                    if (!btn.disabled && !btn.classList.contains('pointer-events-none')) {
-                        btn.click();
-                        sideClicked = true;
-                        await sleep(100);
-                    }
+                    btn.click();
+                    sideClicked = true;
+                    await sleep(100);
                     break;
                 }
             }

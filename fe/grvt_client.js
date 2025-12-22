@@ -124,12 +124,40 @@
                 break;
 
             case 'REPORT_STATUS':
-                // 报告当前GRVT状态
+                // 报告当前GRVT状态 - 使用更稳定的检测逻辑
+                const positionCount = getPositionCount();
+                const pendingCount = getPendingOrderCount();
+                let positionInfo = null;
+                let hasPosition = false;
+
+                // 多次尝试获取仓位信息，确保准确性
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    positionInfo = getCurrentPosition();
+                    if (positionInfo && positionInfo.size > 0 && positionInfo.entryPrice > 0) {
+                        hasPosition = true;
+                        break;
+                    }
+                    // 等待一小段时间再试
+                    if (attempt < 2) {
+                        sleep(200);
+                    }
+                }
+
+                // 如果多次尝试仍未获取到有效仓位信息，回退到标签计数
+                if (!hasPosition && positionCount > 0) {
+                    log('仓位信息获取失败，使用标签计数作为备选', 'warning');
+                    hasPosition = true;
+                }
+
                 const status = {
-                    hasPosition: hasPosition(),
-                    hasPendingOrders: hasPendingOrders(),
-                    positionInfo: getCurrentPosition()
+                    hasPosition: hasPosition,
+                    hasPendingOrders: pendingCount > 0,
+                    positionInfo: positionInfo
                 };
+
+                // 添加更详细的调试信息
+                log(`状态检查详情: 仓位标签=${positionCount}, 订单标签=${pendingCount}, 解析大小=${positionInfo?.size || 0}, 解析价格=${positionInfo?.entryPrice || 0}`, 'info');
+
                 ws.send(JSON.stringify({
                     type: 'GRVT_STATUS_REPORT',
                     sessionId: SESSION_ID,
@@ -549,84 +577,111 @@
                 sleep(300);
             }
 
-            // 查找仓位表格行
-            const positionRows = document.querySelectorAll('.style_tableRow__gbjWO, [data-sentry-component*="TableRow"]');
-            if (positionRows.length > 0) {
-                const firstRow = positionRows[0];
+            // 使用正确的选择器查找仓位单元格
+            const cells = document.querySelectorAll('[data-sentry-element="CellWrapper"]');
+            if (cells.length === 0) {
+                log('未找到仓位单元格', 'warning');
+                return null;
+            }
 
-                // 尝试提取仓位信息
-                let side = 'unknown';
-                let size = 0;
-                let entryPrice = 0;
-                let pnl = 0;
-                let symbol = '';
+            log(`找到 ${cells.length} 个仓位单元格`, 'info');
 
-                // 从行中提取数据
-                const cells = firstRow.querySelectorAll('[data-sentry-element="TableCell"], .heading-12, .body-12, [data-sentry-component*="Cell"]');
-                log(`找到 ${cells.length} 个仓位单元格`, 'info');
+            // 提取单元格文本
+            const cellTexts = [];
+            cells.forEach((cell, index) => {
+                const text = cell.textContent.trim();
+                cellTexts.push(text);
+                log(`仓位单元格 ${index}: "${text}"`, 'info');
+            });
 
-                cells.forEach((cell, index) => {
+            // GRVT仓位表格结构（基于实际DOM分析）:
+            // 0: 交易对 (BTC)
+            // 1: 杠杆信息 (Cross 50x) - 包含方向信息
+            // 2: 仓位大小 (-0.003 BTC)
+            // 3: 盈亏 (-268.57)
+            // 4: 标记价 (89,571.1)
+            // 5: 开仓价 (89,509.2)
+            // 6: 强平价 (91,587.2)
+            // 7+: 其他字段
+
+            let symbol = '';
+            let side = 'unknown';
+            let size = 0;
+            let entryPrice = 0;
+            let pnl = 0;
+
+            // 解析交易对
+            if (cellTexts[0]) {
+                symbol = cellTexts[0];
+            }
+
+            // 解析方向 - 从杠杆信息或仓位大小判断
+            if (cellTexts[1] && cellTexts[1].includes('Cross')) {
+                // 杠杆信息通常不包含方向，需要从仓位大小判断
+            }
+
+            // 解析仓位大小 (格式如: -0.003 BTC 或 0.003 BTC)
+            if (cellTexts[2]) {
+                const sizeMatch = cellTexts[2].match(/([+-]?\d+\.?\d*)/);
+                if (sizeMatch) {
+                    size = parseFloat(sizeMatch[1]);
+                    // 根据正负号判断多空方向
+                    if (size > 0) {
+                        side = 'long';
+                    } else if (size < 0) {
+                        side = 'short';
+                        size = Math.abs(size); // 转为正数
+                    }
+                }
+            }
+
+            // 解析盈亏
+            if (cellTexts[3]) {
+                const pnlMatch = cellTexts[3].match(/([+-]?\d+\.?\d*)/);
+                if (pnlMatch) {
+                    pnl = parseFloat(pnlMatch[1]);
+                }
+            }
+
+            // 解析标记价
+            if (cellTexts[4]) {
+                const markMatch = cellTexts[4].match(/([\d,]+\.?\d*)/);
+                if (markMatch) {
+                    // 标记价暂时不需要，但可以用于验证
+                }
+            }
+
+            // 解析开仓价
+            if (cellTexts[5]) {
+                const entryMatch = cellTexts[5].match(/([\d,]+\.?\d*)/);
+                if (entryMatch) {
+                    entryPrice = parseNumber(entryMatch[0]);
+                }
+            }
+
+            // 如果还没确定方向，从其他字段判断
+            if (side === 'unknown') {
+                cells.forEach(cell => {
                     const text = cell.textContent.trim();
-                    log(`仓位单元格 ${index}: "${text}"`, 'info');
-
-                    // 判断多空方向 - 从单元格内容判断
                     if (text.includes('做多') || text.includes('Long') || text.includes('Buy') || text.includes('买入')) {
                         side = 'long';
                     } else if (text.includes('做空') || text.includes('Short') || text.includes('Sell') || text.includes('卖出')) {
                         side = 'short';
                     }
-
-                    // 提取数值
-                    const numMatch = text.match(/[\d,]+\.?\d*/);
-                    if (numMatch) {
-                        const num = parseNumber(numMatch[0]);
-
-                        // 根据内容类型判断字段
-                        if (text.includes('XRP') || text.includes('USDT')) {
-                            symbol = text; // 交易对
-                        } else if (text.includes('.') && num > 0 && num < 100000 && entryPrice === 0) {
-                            entryPrice = num; // 开仓价格
-                        } else if (text.includes('.') && Math.abs(num) < 10000 && pnl === 0) {
-                            pnl = num; // 盈亏
-                        } else if (!text.includes('.') && num > 0 && size === 0) {
-                            size = num; // 仓位大小
-                        }
-                    }
                 });
-
-                // 如果没找到明确的指标，尝试从单元格位置推断
-                if (entryPrice === 0 || size === 0) {
-                    cells.forEach((cell, index) => {
-                        const text = cell.textContent.trim();
-                        const numMatch = text.match(/[\d,]+\.?\d*/);
-
-                        if (numMatch) {
-                            const num = parseNumber(numMatch[0]);
-                            // 通常结构: [交易对, 方向, 大小, 开仓价, 标记价, 强平价, 盈亏, ...]
-                            if (index === 3 && entryPrice === 0) {
-                                entryPrice = num;
-                            } else if (index === 4 && size === 0 && num < 1000) {
-                                size = num;
-                            } else if (index >= 6 && pnl === 0 && Math.abs(num) < 1000) {
-                                pnl = num;
-                            }
-                        }
-                    });
-                }
-
-                const result = {
-                    side,
-                    size,
-                    entryPrice,
-                    pnl,
-                    symbol
-                };
-
-                log(`解析仓位信息: 方向=${side}, 大小=${size}, 开仓价=${entryPrice}, 盈亏=${pnl}`, 'info');
-                return result;
-            } else {
-                log('未找到仓位表格行', 'warning');
             }
+
+            const result = {
+                side,
+                size,
+                entryPrice,
+                pnl,
+                symbol
+            };
+
+            log(`解析仓位信息: 方向=${side}, 大小=${size}, 开仓价=${entryPrice}, 盈亏=${pnl}`, 'info');
+            return result;
+
         } catch (e) {
             log(`获取仓位信息失败: ${e.message}`, 'warning');
         }
