@@ -731,10 +731,19 @@ function handleMessage(ws, msg) {
                 const session = sessions.get(sessionId);
                 if (msg.orderType === 'open') {
                     session.orders.openGrvt.status = OrderStatus.ACTIVE;
-                    log(`✓ GRVT开仓订单已挂出`, 'info', sessionId);
+                    // 保存实际挂单价格（从订单簿点击获取的）
+                    if (msg.price) {
+                        session.orders.openGrvt.price = msg.price;
+                        session.position.grvtEntryPrice = msg.price;
+                    }
+                    log(`✓ GRVT开仓订单已挂出 @ ${msg.price}`, 'info', sessionId);
                 } else if (msg.orderType === 'close') {
                     session.orders.closeGrvt.status = OrderStatus.ACTIVE;
-                    log(`✓ GRVT平仓订单已挂出`, 'info', sessionId);
+                    // 保存实际挂单价格
+                    if (msg.price) {
+                        session.orders.closeGrvt.price = msg.price;
+                    }
+                    log(`✓ GRVT平仓订单已挂出 @ ${msg.price}`, 'info', sessionId);
                 }
             }
             break;
@@ -812,30 +821,135 @@ function handleMessage(ws, msg) {
             }
             break;
         
+        // VAR订单已提交
+        case 'VAR_ORDER_SUBMITTED':
+            if (sessionId && sessions.has(sessionId)) {
+                const session = sessions.get(sessionId);
+                if (msg.orderType === 'open') {
+                    session.orders.openVar.status = OrderStatus.ACTIVE;
+                    session.orders.openVar.side = msg.side;
+                    session.orders.openVar.quantity = msg.quantity;
+                    session.orders.openVar.createdAt = Date.now();
+                    log(`📤 VAR开仓订单已提交，等待成交确认...`, 'info', sessionId);
+                } else if (msg.orderType === 'close') {
+                    session.orders.closeVar.status = OrderStatus.ACTIVE;
+                    session.orders.closeVar.side = msg.side;
+                    session.orders.closeVar.quantity = msg.quantity;
+                    session.orders.closeVar.createdAt = Date.now();
+                    log(`📤 VAR平仓订单已提交，等待成交确认...`, 'info', sessionId);
+                }
+            }
+            break;
+
         // VAR订单成交
         case 'VAR_ORDER_FILLED':
             if (sessionId && sessions.has(sessionId)) {
                 const session = sessions.get(sessionId);
-                
+
                 if (msg.orderType === 'open') {
                     log(`✅ VAR开仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.openVar.status = OrderStatus.FILLED;
                     session.position.varEntryPrice = msg.price;
                     session.position.isOpen = true;
-                    
+
                     log(`🎉 套利仓位已建立!`, 'success', sessionId);
                     log(`   GRVT ${session.position.grvtSide} @ ${session.position.grvtEntryPrice}`, 'info', sessionId);
                     log(`   VAR ${session.position.varSide} @ ${session.position.varEntryPrice}`, 'info', sessionId);
-                    
+
                     broadcastToSession(sessionId, { type: 'POSITION_OPENED', position: session.position, sessionId });
                     broadcastSessionList();
                 } else if (msg.orderType === 'close') {
                     log(`✅ VAR平仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.closeVar.status = OrderStatus.FILLED;
-                    
+
                     log(`🎉 套利仓位已平仓!`, 'success', sessionId);
                     resetPosition(sessionId);
                 }
+            }
+            break;
+
+        // VAR订单失败
+        case 'VAR_ORDER_FAILED':
+            if (sessionId && sessions.has(sessionId)) {
+                const session = sessions.get(sessionId);
+                const retryCount = msg.retryCount || 0;
+
+                if (msg.orderType === 'open') {
+                    log(`❌ VAR开仓订单失败: ${msg.reason} (重试${retryCount}次)`, 'error', sessionId);
+                    session.orders.openVar.status = OrderStatus.FAILED;
+
+                    // 如果重试次数未达上限，重新发送VAR开仓指令
+                    if (retryCount < session.config.maxRetries) {
+                        log(`🔄 重新发送VAR开仓指令...`, 'warning', sessionId);
+                        setTimeout(() => {
+                            sendTo(sessionId, 'var', {
+                                type: 'PLACE_MARKET_ORDER',
+                                side: session.pendingVarOrder?.side || msg.side,
+                                quantity: session.pendingVarOrder?.quantity || msg.quantity,
+                                orderType: 'open',
+                                urgent: true
+                            });
+                        }, session.config.retryDelay);
+                    } else {
+                        log(`❌ VAR开仓重试次数已达上限，取消此次套利`, 'error', sessionId);
+                        // 取消GRVT订单（如果还没成交）
+                        sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
+                        resetOpenOrders(sessionId);
+                    }
+                } else if (msg.orderType === 'close') {
+                    log(`❌ VAR平仓订单失败: ${msg.reason} (重试${retryCount}次)`, 'error', sessionId);
+                    session.orders.closeVar.status = OrderStatus.FAILED;
+
+                    // 如果重试次数未达上限，重新发送VAR平仓指令
+                    if (retryCount < session.config.maxRetries) {
+                        log(`🔄 重新发送VAR平仓指令...`, 'warning', sessionId);
+                        setTimeout(() => {
+                            const pos = session.position;
+                            sendTo(sessionId, 'var', {
+                                type: 'PLACE_MARKET_ORDER',
+                                side: pos.varSide === 'long' ? 'sell' : 'buy',
+                                quantity: pos.quantity,
+                                orderType: 'close',
+                                urgent: true
+                            });
+                        }, session.config.retryDelay);
+                    } else {
+                        log(`❌ VAR平仓重试次数已达上限，使用紧急平仓`, 'error', sessionId);
+                        executeEmergencyClose(sessionId);
+                    }
+                }
+            }
+            break;
+
+        // VAR订单成交状态不确定
+        case 'VAR_ORDER_UNCONFIRMED':
+            if (sessionId && sessions.has(sessionId)) {
+                const session = sessions.get(sessionId);
+                log(`⚠️ VAR订单成交状态不确定，等待进一步确认...`, 'warning', sessionId);
+
+                // 设置超时检查，如果在一定时间内还没确认，就重试
+                setTimeout(() => {
+                    if (msg.orderType === 'open' && session.orders.openVar.status !== OrderStatus.FILLED) {
+                        log(`⏰ VAR开仓订单确认超时，重新发送...`, 'warning', sessionId);
+                        sendTo(sessionId, 'var', {
+                            type: 'PLACE_MARKET_ORDER',
+                            side: msg.side,
+                            quantity: msg.quantity,
+                            orderType: 'open',
+                            urgent: true
+                        });
+                    } else if (msg.orderType === 'close' && session.orders.closeVar.status !== OrderStatus.FILLED) {
+                        log(`⏰ VAR平仓订单确认超时，重新发送...`, 'warning', sessionId);
+                        const pos = session.position;
+                        sendTo(sessionId, 'var', {
+                            type: 'PLACE_MARKET_ORDER',
+                            side: pos.varSide === 'long' ? 'sell' : 'buy',
+                            quantity: pos.quantity,
+                            orderType: 'close',
+                            urgent: true
+                        });
+                    }
+                }, 3000); // 3秒后检查
             }
             break;
         
@@ -884,6 +998,42 @@ function handleMessage(ws, msg) {
                 Object.assign(session.config, msg.config);
                 log(`配置已更新`, 'info', sessionId);
                 broadcastToSession(sessionId, { type: 'CONFIG_UPDATED', config: session.config, sessionId });
+            }
+            break;
+
+        // 请求GRVT状态检查
+        case 'CHECK_GRVT_STATUS':
+            if (sessionId && sessions.has(sessionId)) {
+                sendTo(sessionId, 'grvt', { type: 'REPORT_STATUS' });
+            }
+            break;
+
+        // GRVT状态报告
+        case 'GRVT_STATUS_REPORT':
+            if (sessionId && sessions.has(sessionId)) {
+                const session = sessions.get(sessionId);
+                const { hasPosition, hasPendingOrders, positionInfo } = msg;
+
+                // 更新会话状态
+                if (hasPosition !== undefined) {
+                    session.position.isOpen = hasPosition;
+                    if (positionInfo) {
+                        session.position.grvtSide = positionInfo.side === 'long' ? 'long' : 'short';
+                        session.position.quantity = positionInfo.size;
+                        session.position.grvtEntryPrice = positionInfo.entryPrice;
+                    }
+                }
+
+                // 检查订单状态
+                if (hasPendingOrders !== undefined) {
+                    // 如果有未完成订单，说明可能有挂单
+                    if (hasPendingOrders && session.orders.openGrvt.status === OrderStatus.NONE) {
+                        session.orders.openGrvt.status = OrderStatus.ACTIVE;
+                    }
+                }
+
+                log(`GRVT状态更新: 仓位=${hasPosition}, 未完成订单=${hasPendingOrders}`, 'info', sessionId);
+                broadcastSessionList();
             }
             break;
         
@@ -964,33 +1114,72 @@ setInterval(() => {
 // 检查订单超时 (每500ms)
 setInterval(() => {
     const now = Date.now();
-    
+
     sessions.forEach((session, sessionId) => {
         if (!session.isRunning) return;
-        
-        // 检查开仓订单超时
-        const openOrder = session.orders.openGrvt;
-        if (openOrder.status === OrderStatus.ACTIVE && openOrder.createdAt) {
-            const elapsed = now - openOrder.createdAt;
+
+        // 检查GRVT开仓订单超时
+        const openGrvtOrder = session.orders.openGrvt;
+        if (openGrvtOrder.status === OrderStatus.ACTIVE && openGrvtOrder.createdAt) {
+            const elapsed = now - openGrvtOrder.createdAt;
             if (elapsed > session.config.orderTimeout) {
                 log(`⏰ GRVT开仓订单超时(${(elapsed/1000).toFixed(1)}s)，取消重挂...`, 'warning', sessionId);
                 sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
-                openOrder.status = OrderStatus.CANCELLED;
+                openGrvtOrder.status = OrderStatus.CANCELLED;
                 // 延迟后重挂
                 setTimeout(() => retryOpenGrvtOrder(sessionId), session.config.retryDelay);
             }
         }
-        
-        // 检查平仓订单超时
-        const closeOrder = session.orders.closeGrvt;
-        if (closeOrder.status === OrderStatus.ACTIVE && closeOrder.createdAt) {
-            const elapsed = now - closeOrder.createdAt;
+
+        // 检查GRVT平仓订单超时
+        const closeGrvtOrder = session.orders.closeGrvt;
+        if (closeGrvtOrder.status === OrderStatus.ACTIVE && closeGrvtOrder.createdAt) {
+            const elapsed = now - closeGrvtOrder.createdAt;
             if (elapsed > session.config.orderTimeout) {
                 log(`⏰ GRVT平仓订单超时(${(elapsed/1000).toFixed(1)}s)，取消重挂...`, 'warning', sessionId);
                 sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'close' });
-                closeOrder.status = OrderStatus.CANCELLED;
+                closeGrvtOrder.status = OrderStatus.CANCELLED;
                 // 延迟后重挂
                 setTimeout(() => retryCloseGrvtOrder(sessionId), session.config.retryDelay);
+            }
+        }
+
+        // 检查VAR开仓订单超时
+        const openVarOrder = session.orders.openVar;
+        if (openVarOrder.status === OrderStatus.ACTIVE && openVarOrder.createdAt) {
+            const elapsed = now - openVarOrder.createdAt;
+            if (elapsed > 3000) { // VAR订单3秒超时
+                log(`⏰ VAR开仓订单超时(${(elapsed/1000).toFixed(1)}s)，重新发送...`, 'warning', sessionId);
+                openVarOrder.status = OrderStatus.NONE;
+                // 重新发送VAR开仓指令
+                if (session.pendingVarOrder) {
+                    sendTo(sessionId, 'var', {
+                        type: 'PLACE_MARKET_ORDER',
+                        ...session.pendingVarOrder,
+                        urgent: true
+                    });
+                }
+            }
+        }
+
+        // 检查VAR平仓订单超时
+        const closeVarOrder = session.orders.closeVar;
+        if (closeVarOrder.status === OrderStatus.ACTIVE && closeVarOrder.createdAt) {
+            const elapsed = now - closeVarOrder.createdAt;
+            if (elapsed > 3000) { // VAR订单3秒超时
+                log(`⏰ VAR平仓订单超时(${(elapsed/1000).toFixed(1)}s)，重新发送...`, 'warning', sessionId);
+                closeVarOrder.status = OrderStatus.NONE;
+                // 重新发送VAR平仓指令
+                const pos = session.position;
+                if (pos.isOpen) {
+                    sendTo(sessionId, 'var', {
+                        type: 'PLACE_MARKET_ORDER',
+                        side: pos.varSide === 'long' ? 'sell' : 'buy',
+                        quantity: pos.quantity,
+                        orderType: 'close',
+                        urgent: true
+                    });
+                }
             }
         }
     });
@@ -1017,6 +1206,16 @@ setInterval(() => {
     broadcastSessionList();
 }, 2000);
 
+// 定时检查所有会话的GRVT状态 (每10秒)
+setInterval(() => {
+    sessions.forEach((session, sessionId) => {
+        if (session.clients.grvt && session.clients.grvt.readyState === WebSocket.OPEN) {
+            sendTo(sessionId, 'grvt', { type: 'REPORT_STATUS' });
+        }
+    });
+}, 10000);
+
 log(`服务器已启动，等待客户端连接...`, 'success');
 log(`策略: GRVT双限价单(双Maker返佣) + VAR市价单`, 'info');
 log(`预计成本: ~0.048% (VAR点差 - GRVT双返佣)`, 'info');
+log(`状态检查: 每10秒同步一次GRVT仓位和订单信息`, 'info');

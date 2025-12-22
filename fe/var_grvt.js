@@ -29,8 +29,24 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 */
 
-// 如果在本地HTML控制面板中运行，提供控制接口
-const ARBITRAGE_CONTROLLER = {
+        // 测试GRVT状态检测功能
+        function testGrvtStatus() {
+            console.log('🧪 测试GRVT状态检测...');
+
+            // 发送状态检查请求
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'CHECK_GRVT_STATUS',
+                    sessionId: 'session1'
+                }));
+                console.log('✅ 已发送状态检查请求');
+            } else {
+                console.log('❌ WebSocket未连接');
+            }
+        }
+
+        // 如果在本地HTML控制面板中运行，提供控制接口
+        const ARBITRAGE_CONTROLLER = {
     ws: null,
     config: {
         wsUrl: 'ws://localhost:8765',
