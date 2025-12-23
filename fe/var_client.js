@@ -323,97 +323,9 @@
         return true;
     }
     
-    function createStatusPanel() {
-        const existing = document.getElementById('var-arb-panel');
-        if (existing) existing.remove();
-        
-        const panel = document.createElement('div');
-        panel.id = 'var-arb-panel';
-        panel.innerHTML = `
-            <style>
-                #var-arb-panel {
-                    position: fixed;
-                    top: 60px;
-                    left: 10px;
-                    background: linear-gradient(135deg, #0d1421 0%, #182238 100%);
-                    border: 2px solid #4C9AF8;
-                    border-radius: 10px;
-                    padding: 12px;
-                    z-index: 10000;
-                    font-family: monospace;
-                    font-size: 11px;
-                    color: #fff;
-                    min-width: 200px;
-                }
-                #var-arb-panel h4 {
-                    margin: 0 0 8px 0;
-                    color: #4C9AF8;
-                    font-size: 12px;
-                }
-                #var-arb-panel .session-id {
-                    background: rgba(76, 154, 248, 0.2);
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    margin-left: 5px;
-                }
-                #var-arb-panel .status-line {
-                    display: flex;
-                    justify-content: space-between;
-                    padding: 4px 0;
-                    border-bottom: 1px solid rgba(255,255,255,0.1);
-                }
-                #var-arb-panel .connected { color: #00ff88; }
-                #var-arb-panel .disconnected { color: #ff4466; }
-            </style>
-            <h4>🔵 VAR<span class="session-id">${SESSION_ID}</span></h4>
-            <div class="status-line">
-                <span>服务器</span>
-                <span id="var-ws-status" class="disconnected">断开</span>
-            </div>
-            <div class="status-line">
-                <span>Bid/Ask</span>
-                <span id="var-prices">-</span>
-            </div>
-            <div class="status-line">
-                <span>点差</span>
-                <span id="var-spread">-</span>
-            </div>
-        `;
-        document.body.appendChild(panel);
-        
-        setInterval(() => {
-            const wsStatus = document.getElementById('var-ws-status');
-            if (wsStatus) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    wsStatus.textContent = '已连接';
-                    wsStatus.className = 'connected';
-                } else {
-                    wsStatus.textContent = '断开';
-                    wsStatus.className = 'disconnected';
-                }
-            }
-            
-            const prices = getPrices();
-            
-            const pricesEl = document.getElementById('var-prices');
-            if (pricesEl) {
-                pricesEl.textContent = prices.bid && prices.ask ? 
-                    `${prices.bid} / ${prices.ask}` : '-';
-            }
-            
-            const spreadEl = document.getElementById('var-spread');
-            if (spreadEl) {
-                spreadEl.textContent = prices.spread ? 
-                    `${(prices.spread * 100).toFixed(4)}%` : '-';
-            }
-        }, 500);
-    }
-    
     function init() {
         log(`VAR套利客户端已加载 (会话: ${SESSION_ID})`, 'success');
         log('正在连接套利服务器...', 'info');
-        createStatusPanel();
         connect();
     }
     

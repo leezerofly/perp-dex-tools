@@ -174,23 +174,19 @@
         log(`取消${orderType === 'open' ? '开仓' : '平仓'}订单...`, 'warning');
         
         try {
-            // 点击订单簿中的取消按钮
-            const cancelBtns = document.querySelectorAll('button[aria-label="Cancel"], .cancel-order-btn');
-            for (const btn of cancelBtns) {
-                btn.click();
+            // 点击未成交tab
+            const uncompletedTab = document.querySelector('[data-text*="未成交订单"]');
+            if (uncompletedTab) {
+                uncompletedTab.click();
                 await sleep(100);
             }
             
-            // 或者尝试通过订单列表取消
-            const orderRows = document.querySelectorAll('[data-sentry-component="OpenOrderRow"]');
-            for (const row of orderRows) {
-                const cancelBtn = row.querySelector('button');
-                if (cancelBtn) {
-                    cancelBtn.click();
-                    await sleep(100);
-                }
+            // 点击取消所有订单按钮
+            const cancelAllBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.trim() === '取消所有订单');
+            if (cancelAllBtn) {
+                cancelAllBtn.click();
+                await sleep(100);
             }
-            
             currentOrder.status = 'cancelled';
             log('订单取消成功', 'success');
         } catch (e) {
@@ -706,86 +702,9 @@
         return getPositionCount() > 0;
     }
     
-    function createStatusPanel() {
-        const existing = document.getElementById('grvt-arb-panel');
-        if (existing) existing.remove();
-        
-        const panel = document.createElement('div');
-        panel.id = 'grvt-arb-panel';
-        panel.innerHTML = `
-            <style>
-                #grvt-arb-panel {
-                    position: fixed;
-                    top: 60px;
-                    left: 10px;
-                    background: linear-gradient(135deg, #0a1628 0%, #1a2d4e 100%);
-                    border: 2px solid #B0E870;
-                    border-radius: 10px;
-                    padding: 12px;
-                    z-index: 10000;
-                    font-family: monospace;
-                    font-size: 11px;
-                    color: #fff;
-                    min-width: 200px;
-                }
-                #grvt-arb-panel h4 {
-                    margin: 0 0 8px 0;
-                    color: #B0E870;
-                    font-size: 12px;
-                }
-                #grvt-arb-panel .session-id {
-                    background: rgba(176, 232, 112, 0.2);
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    margin-left: 5px;
-                }
-                #grvt-arb-panel .status-line {
-                    display: flex;
-                    justify-content: space-between;
-                    padding: 4px 0;
-                    border-bottom: 1px solid rgba(255,255,255,0.1);
-                }
-                #grvt-arb-panel .connected { color: #B0E870; }
-                #grvt-arb-panel .disconnected { color: #FE4E86; }
-            </style>
-            <h4>🟢 GRVT<span class="session-id">${SESSION_ID}</span></h4>
-            <div class="status-line">
-                <span>服务器</span>
-                <span id="grvt-ws-status" class="disconnected">断开</span>
-            </div>
-            <div class="status-line">
-                <span>Bid/Ask</span>
-                <span id="grvt-prices">-</span>
-            </div>
-        `;
-        document.body.appendChild(panel);
-        
-        setInterval(() => {
-            const wsStatus = document.getElementById('grvt-ws-status');
-            if (wsStatus) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    wsStatus.textContent = '已连接';
-                    wsStatus.className = 'connected';
-                } else {
-                    wsStatus.textContent = '断开';
-                    wsStatus.className = 'disconnected';
-                }
-            }
-            
-            const pricesEl = document.getElementById('grvt-prices');
-            if (pricesEl) {
-                const prices = getBestPrices();
-                pricesEl.textContent = prices.bid && prices.ask ? 
-                    `${prices.bid} / ${prices.ask}` : '-';
-            }
-        }, 500);
-    }
-    
     function init() {
         log(`GRVT套利客户端已加载 (会话: ${SESSION_ID})`, 'success');
         log('正在连接套利服务器...', 'info');
-        createStatusPanel();
         connect();
     }
     
