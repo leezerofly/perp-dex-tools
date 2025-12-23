@@ -35,6 +35,8 @@ function createSession(sessionId) {
         // 仓位信息
         position: {
             isOpen: false,
+            grvtOpen: false,      // GRVT是否已开仓
+            varOpen: false,       // VAR是否已开仓
             grvtSide: null,       // 'long' or 'short'
             varSide: null,
             grvtEntryPrice: 0,
@@ -85,16 +87,20 @@ function createSession(sessionId) {
         config: {
             symbol: 'BTC/USDT',
             orderSize: 0.003,
-            
+
             // === 收益阈值 (GRVT双Maker策略) ===
             // 总成本 = VAR点差(~0.05%) - GRVT双返佣(0.002%) ≈ 0.048%
             minProfitToOpen: 0,          // 开仓最小净收益率 (0=保本就开)
             minProfitToClose: 0,         // 平仓最小净收益率 (0=可以立即平)
-            
+
             // GRVT费率
             grvtMakerFee: -0.00001,      // -0.001% maker返佣
             grvtTakerFee: 0.00037,       // 0.037% taker费用 (备用)
-            
+
+            // === 持仓时间控制 ===
+            minHoldMinutes: 15,           // 最小持仓时间(分钟)
+            maxHoldMinutes: 20,           // 最大持仓时间(分钟)
+
             // === 订单超时设置 ===
             orderTimeout: 30000,          // 限价单超时(ms)，超时后取消重挂
             maxRetries: 10,              // 最大重试次数
@@ -141,8 +147,11 @@ function log(msg, type = 'info', sessionId = null) {
 function broadcastToSession(sessionId, message, excludeType = null) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
-    const msgStr = JSON.stringify(message);
+
+    // 确保消息包含sessionId
+    const messageWithSessionId = { ...message, sessionId };
+
+    const msgStr = JSON.stringify(messageWithSessionId);
     Object.entries(session.clients).forEach(([type, client]) => {
         if (client && client.readyState === WebSocket.OPEN && type !== excludeType) {
             client.send(msgStr);
@@ -173,10 +182,12 @@ const globalControllers = new Set();
 function sendTo(sessionId, clientType, message) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
+
     const client = session.clients[clientType];
     if (client && client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify(message));
+        // 确保消息包含sessionId
+        const messageWithSessionId = { ...message, sessionId };
+        client.send(JSON.stringify(messageWithSessionId));
     }
 }
 
@@ -261,76 +272,95 @@ function calcRoundTripProfit(session, side, quantity) {
 // 开仓逻辑
 // ============================================
 
-// 检查开仓机会
+// 检查开仓机会 (简化版：只计算价差和方向)
 function checkOpenOpportunity(sessionId) {
     const session = sessions.get(sessionId);
     if (!session || !session.isRunning) return;
-    
-    // 如果已有仓位或正在开仓，跳过
-    if (session.position.isOpen) return;
-    if (session.orders.openGrvt.status === OrderStatus.PENDING || 
+
+    // 如果已有完整仓位或GRVT正在开仓，跳过
+    if (session.position.isOpen || session.position.grvtOpen) return;
+    if (session.orders.openGrvt.status === OrderStatus.PENDING ||
         session.orders.openGrvt.status === OrderStatus.ACTIVE) return;
-    
+
     const { grvt, var: varPrices } = session.prices;
     if (!grvt.bid || !grvt.ask || !varPrices.bid || !varPrices.ask) return;
-    
-    // 计算两个方向的完整往返收益
-    const profit1 = calcRoundTripProfit(session, 'grvt_buy_var_sell', session.config.orderSize);
-    const profit2 = calcRoundTripProfit(session, 'grvt_sell_var_buy', session.config.orderSize);
-    
-    // 选择收益更高的策略
-    const bestStrategy = profit1.netProfit > profit2.netProfit ? profit1 : profit2;
-    
-    // 判断是否满足开仓条件
-    if (bestStrategy.profitPercent >= session.config.minProfitToOpen) {
+
+    // 计算两个方向的价差
+    const grvtBuyVarSellSpread = varPrices.bid - grvt.bid;
+    const grvtSellVarBuySpread = grvt.ask - varPrices.ask;
+
+    // 判断是否有套利机会（价差为正）
+    const hasOpportunity1 = grvtBuyVarSellSpread > 0;
+    const hasOpportunity2 = grvtSellVarBuySpread > 0;
+
+    if (hasOpportunity1 || hasOpportunity2) {
+        let bestDirection;
+        let spreadValue;
+
+        if (hasOpportunity1 && hasOpportunity2) {
+            // 两个方向都有机会，选择价差更大的
+            if (grvtBuyVarSellSpread > grvtSellVarBuySpread) {
+                bestDirection = 'grvt_buy_var_sell';
+                spreadValue = grvtBuyVarSellSpread;
+            } else {
+                bestDirection = 'grvt_sell_var_buy';
+                spreadValue = grvtSellVarBuySpread;
+            }
+        } else if (hasOpportunity1) {
+            bestDirection = 'grvt_buy_var_sell';
+            spreadValue = grvtBuyVarSellSpread;
+        } else {
+            bestDirection = 'grvt_sell_var_buy';
+            spreadValue = grvtSellVarBuySpread;
+        }
+
         log(`🎯 发现套利机会!`, 'success', sessionId);
-        log(`   方向: ${bestStrategy.side === 'grvt_buy_var_sell' ? 'GRVT买/VAR卖' : 'GRVT卖/VAR买'}`, 'info', sessionId);
-        log(`   价差收益: $${bestStrategy.crossExchangeSpread.toFixed(4)}`, 'info', sessionId);
-        log(`   GRVT双返佣: +$${bestStrategy.totalGrvtRebate.toFixed(4)}`, 'info', sessionId);
-        log(`   VAR点差: -$${bestStrategy.totalVarSpreadCost.toFixed(4)}`, 'info', sessionId);
-        log(`   净收益: $${bestStrategy.netProfit.toFixed(4)} (${(bestStrategy.profitPercent * 100).toFixed(4)}%)`, 'success', sessionId);
-        
-        executeOpenGrvtOrder(sessionId, bestStrategy);
+        log(`   方向: ${bestDirection === 'grvt_buy_var_sell' ? 'GRVT买/VAR卖' : 'GRVT卖/VAR买'}`, 'info', sessionId);
+        log(`   价差: $${spreadValue.toFixed(4)}`, 'info', sessionId);
+
+        executeOpenGrvtOrder(sessionId, bestDirection, spreadValue);
     }
 }
 
-// 执行GRVT开仓限价单
-function executeOpenGrvtOrder(sessionId, strategy) {
+// 执行GRVT开仓限价单 (简化版：不指定价格，由GRVT客户端点击订单簿)
+function executeOpenGrvtOrder(sessionId, direction, spreadValue) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
-    const grvtSide = strategy.side === 'grvt_buy_var_sell' ? 'buy' : 'sell';
-    const varSide = strategy.side === 'grvt_buy_var_sell' ? 'sell' : 'buy';
-    
+
+    const grvtSide = direction === 'grvt_buy_var_sell' ? 'buy' : 'sell';
+    const varSide = direction === 'grvt_buy_var_sell' ? 'sell' : 'buy';
+
     // 更新订单状态
     session.orders.openGrvt = {
         status: OrderStatus.PENDING,
         side: grvtSide,
-        price: strategy.grvtEntryPrice,
+        price: 0, // 不预设价格，由GRVT客户端点击订单簿获取
         quantity: session.config.orderSize,
         createdAt: Date.now(),
         retryCount: 0
     };
-    
+
     // 记录待执行的VAR订单
     session.pendingVarOrder = {
         side: varSide,
-        quantity: session.config.orderSize
+        quantity: session.config.orderSize,
+        orderType: 'open'
     };
-    
+
     // 预设仓位信息
     session.position.grvtSide = grvtSide === 'buy' ? 'long' : 'short';
     session.position.varSide = varSide === 'buy' ? 'long' : 'short';
     session.position.quantity = session.config.orderSize;
-    
-    log(`📤 发送GRVT开仓限价单: ${grvtSide} @ ${strategy.grvtEntryPrice}`, 'trade', sessionId);
-    
+    session.position.openTime = Date.now(); // 记录开仓时间
+
+    log(`📤 发送GRVT开仓指令: ${grvtSide} (价差: $${spreadValue.toFixed(4)})`, 'trade', sessionId);
+
     sendTo(sessionId, 'grvt', {
-        type: 'PLACE_LIMIT_ORDER',
+        type: 'OPEN_POSITION',
         orderId: `open_${sessionId}_${Date.now()}`,
         side: grvtSide,
-        price: strategy.grvtEntryPrice,
-        quantity: session.config.orderSize
+        quantity: session.config.orderSize,
+        direction: direction
     });
 }
 
@@ -338,8 +368,14 @@ function executeOpenGrvtOrder(sessionId, strategy) {
 function retryOpenGrvtOrder(sessionId) {
     const session = sessions.get(sessionId);
     if (!session || !session.isRunning) return;
-    
+
     const order = session.orders.openGrvt;
+    // 如果订单已经成交，不要重试
+    if (order.status === OrderStatus.FILLED) {
+        log(`订单已成交，停止重试`, 'info', sessionId);
+        return;
+    }
+
     if (order.retryCount >= session.config.maxRetries) {
         log(`❌ GRVT开仓重试次数已达上限(${session.config.maxRetries})，取消开仓`, 'error', sessionId);
         resetOpenOrders(sessionId);
@@ -378,7 +414,7 @@ function retryOpenGrvtOrder(sessionId) {
 function resetOpenOrders(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
+
     session.orders.openGrvt = {
         status: OrderStatus.NONE,
         side: null,
@@ -388,6 +424,8 @@ function resetOpenOrders(sessionId) {
         retryCount: 0
     };
     session.pendingVarOrder = null;
+    session.position.grvtOpen = false;  // 重置GRVT开仓状态
+    session.position.varOpen = false;   // 重置VAR开仓状态
     session.position.grvtSide = null;
     session.position.varSide = null;
     session.position.quantity = 0;
@@ -397,101 +435,66 @@ function resetOpenOrders(sessionId) {
 // 平仓逻辑 (GRVT限价单)
 // ============================================
 
-// 检查平仓机会
+// 检查平仓机会 (简化版：只检查持仓时间)
 function checkCloseOpportunity(sessionId) {
     const session = sessions.get(sessionId);
     if (!session || !session.position.isOpen || !session.isRunning) return;
-    
+
     // 如果正在平仓，跳过
-    if (session.orders.closeGrvt.status === OrderStatus.PENDING || 
+    if (session.orders.closeGrvt.status === OrderStatus.PENDING ||
         session.orders.closeGrvt.status === OrderStatus.ACTIVE) return;
-    
-    const { grvt, var: varPrices } = session.prices;
-    const pos = session.position;
-    const varSpread = varPrices.spread || 0.0005;
-    const { grvtMakerFee } = session.config;
-    
-    // 计算当前平仓价格 (GRVT用限价单，挂在bid/ask)
-    let grvtClosePrice, varClosePrice;
-    if (pos.grvtSide === 'long') {
-        grvtClosePrice = grvt.ask;      // 限价卖出挂ask (maker)
-        varClosePrice = varPrices.ask;   // 市价买入
-    } else {
-        grvtClosePrice = grvt.bid;       // 限价买入挂bid (maker)
-        varClosePrice = varPrices.bid;   // 市价卖出
-    }
-    
-    const grvtValue = pos.grvtEntryPrice * pos.quantity;
-    
-    // === GRVT双返佣 ===
-    const grvtOpenRebate = grvtValue * Math.abs(grvtMakerFee);
-    const grvtCloseRebate = grvtClosePrice * pos.quantity * Math.abs(grvtMakerFee);
-    const totalGrvtRebate = grvtOpenRebate + grvtCloseRebate;
-    
-    // === VAR点差成本 ===
-    const varOpenSpreadCost = pos.varEntryPrice * pos.quantity * (varSpread / 2);
-    const varCloseSpreadCost = varClosePrice * pos.quantity * (varSpread / 2);
-    const totalVarSpreadCost = varOpenSpreadCost + varCloseSpreadCost;
-    
-    // === 仓位盈亏 ===
-    let grvtPnL, varPnL;
-    if (pos.grvtSide === 'long') {
-        grvtPnL = (grvtClosePrice - pos.grvtEntryPrice) * pos.quantity;
-        varPnL = (pos.varEntryPrice - varClosePrice) * pos.quantity;
-    } else {
-        grvtPnL = (pos.grvtEntryPrice - grvtClosePrice) * pos.quantity;
-        varPnL = (varClosePrice - pos.varEntryPrice) * pos.quantity;
-    }
-    
-    // === 净收益 (双Maker策略) ===
-    const totalCost = totalVarSpreadCost - totalGrvtRebate;
-    const netProfit = grvtPnL + varPnL - totalCost;
-    const profitPercent = netProfit / grvtValue;
-    
-    // 定期输出当前状态 (降低频率避免刷屏)
-    if (Math.random() < 0.05) {
-        log(`📊 仓位状态 - 净收益: $${netProfit.toFixed(4)} (${(profitPercent * 100).toFixed(4)}%)`, 'info', sessionId);
-    }
-    
-    // 平仓条件：满足收益阈值
-    if (profitPercent >= session.config.minProfitToClose) {
-        log(`💰 达到平仓条件!`, 'success', sessionId);
-        log(`   GRVT PnL: $${grvtPnL.toFixed(4)}`, 'info', sessionId);
-        log(`   VAR PnL: $${varPnL.toFixed(4)}`, 'info', sessionId);
-        log(`   GRVT双返佣: +$${totalGrvtRebate.toFixed(4)}`, 'info', sessionId);
-        log(`   VAR点差: -$${totalVarSpreadCost.toFixed(4)}`, 'info', sessionId);
-        log(`   净收益: $${netProfit.toFixed(4)} (${(profitPercent * 100).toFixed(4)}%)`, 'success', sessionId);
+
+    const now = Date.now();
+    const holdTimeMinutes = (now - session.position.openTime) / (1000 * 60);
+
+    // 检查持仓时间是否达到配置的持仓时间
+    const { minHoldMinutes, maxHoldMinutes } = session.config;
+
+    if (holdTimeMinutes >= minHoldMinutes) {
+        if (holdTimeMinutes >= maxHoldMinutes) {
+            // 强制平仓
+            log(`⏰ 持仓时间已达${maxHoldMinutes}分钟，强制平仓`, 'warning', sessionId);
+        } else {
+            // 正常平仓
+            log(`⏰ 持仓时间已达${minHoldMinutes}分钟，开始平仓`, 'info', sessionId);
+        }
+
+        log(`   持仓时间: ${holdTimeMinutes.toFixed(1)}分钟`, 'info', sessionId);
         executeCloseGrvtOrder(sessionId);
     }
 }
 
-// 执行GRVT平仓限价单
+// 执行GRVT平仓限价单 (简化版：不指定价格，由GRVT客户端点击订单簿)
 function executeCloseGrvtOrder(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
+
     const pos = session.position;
-    const { grvt } = session.prices;
     const closeSide = pos.grvtSide === 'long' ? 'sell' : 'buy';
-    const closePrice = pos.grvtSide === 'long' ? grvt.ask : grvt.bid;
-    
+
     // 更新平仓订单状态
     session.orders.closeGrvt = {
         status: OrderStatus.PENDING,
         side: closeSide,
-        price: closePrice,
+        price: 0, // 不预设价格，由GRVT客户端点击订单簿获取
         quantity: pos.quantity,
         createdAt: Date.now(),
         retryCount: 0
     };
-    
-    log(`📤 发送GRVT平仓限价单: ${closeSide} @ ${closePrice}`, 'trade', sessionId);
-    
+
+    // 记录待执行的VAR平仓订单
+    session.pendingVarOrder = {
+        side: closeSide,
+        quantity: pos.quantity,
+        orderType: 'close'
+    };
+
+    log(`📤 发送GRVT平仓指令: ${closeSide}`, 'trade', sessionId);
+
     sendTo(sessionId, 'grvt', {
-        type: 'PLACE_LIMIT_ORDER',
+        type: 'CLOSE_POSITION',
         orderId: `close_${sessionId}_${Date.now()}`,
         side: closeSide,
-        price: closePrice,
         quantity: pos.quantity
     });
 }
@@ -541,25 +544,29 @@ function retryCloseGrvtOrder(sessionId) {
 // 紧急平仓 (市价单)
 function executeEmergencyClose(sessionId) {
     const session = sessions.get(sessionId);
-    if (!session || !session.position.isOpen) return;
-    
+    if (!session || (!session.position.isOpen && !session.position.grvtOpen && !session.position.varOpen)) return;
+
     log('🚨 执行紧急市价平仓...', 'warning', sessionId);
     const pos = session.position;
-    
-    // GRVT市价平仓
-    sendTo(sessionId, 'grvt', {
-        type: 'PLACE_MARKET_ORDER',
-        side: pos.grvtSide === 'long' ? 'sell' : 'buy',
-        quantity: pos.quantity
-    });
-    
-    // VAR市价平仓
-    sendTo(sessionId, 'var', {
-        type: 'PLACE_MARKET_ORDER',
-        side: pos.varSide === 'long' ? 'sell' : 'buy',
-        quantity: pos.quantity
-    });
-    
+
+    // GRVT市价平仓（如果GRVT已开仓）
+    if (session.position.grvtOpen && pos.grvtSide && pos.quantity > 0) {
+        sendTo(sessionId, 'grvt', {
+            type: 'PLACE_MARKET_ORDER',
+            side: pos.grvtSide === 'long' ? 'sell' : 'buy',
+            quantity: pos.quantity
+        });
+    }
+
+    // VAR市价平仓（如果VAR已开仓）
+    if (session.position.varOpen && pos.varSide && pos.quantity > 0) {
+        sendTo(sessionId, 'var', {
+            type: 'PLACE_MARKET_ORDER',
+            side: pos.varSide === 'long' ? 'sell' : 'buy',
+            quantity: pos.quantity
+        });
+    }
+
     // 重置仓位和订单
     resetPosition(sessionId);
 }
@@ -568,9 +575,11 @@ function executeEmergencyClose(sessionId) {
 function resetPosition(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
+
     session.position = {
         isOpen: false,
+        grvtOpen: false,
+        varOpen: false,
         grvtSide: null,
         varSide: null,
         grvtEntryPrice: 0,
@@ -770,22 +779,26 @@ function handleMessage(ws, msg) {
         case 'ORDER_FILLED':
             if (sessionId && sessions.has(sessionId)) {
                 const session = sessions.get(sessionId);
-                
+
                 if (msg.orderType === 'open') {
                     // 开仓订单成交
                     log(`✅ GRVT开仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.openGrvt.status = OrderStatus.FILLED;
                     session.position.grvtEntryPrice = msg.price;
-                    
+                    session.position.grvtOpen = true;  // 标记GRVT已开仓
+
                     // 立即执行VAR开仓
                     if (session.pendingVarOrder) {
-                        log(`📤 发送VAR开仓市价单...`, 'trade', sessionId);
+                        log(`📤 发送VAR开仓市价单: ${session.pendingVarOrder.side} ${session.pendingVarOrder.quantity}`, 'trade', sessionId);
                         sendTo(sessionId, 'var', {
                             type: 'PLACE_MARKET_ORDER',
                             ...session.pendingVarOrder,
-                            urgent: true
+                            urgent: true,
+                            orderType: 'open'
                         });
                         session.pendingVarOrder = null;
+                    } else {
+                        log(`⚠️ GRVT开仓成交但没有待执行的VAR订单`, 'warning', sessionId);
                     }
                 } else if (msg.orderType === 'close') {
                     // 平仓订单成交
@@ -850,7 +863,8 @@ function handleMessage(ws, msg) {
                     log(`✅ VAR开仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.openVar.status = OrderStatus.FILLED;
                     session.position.varEntryPrice = msg.price;
-                    session.position.isOpen = true;
+                    session.position.varOpen = true;  // 标记VAR已开仓
+                    session.position.isOpen = true;   // 完整仓位已建立
 
                     log(`🎉 套利仓位已建立!`, 'success', sessionId);
                     log(`   GRVT ${session.position.grvtSide} @ ${session.position.grvtEntryPrice}`, 'info', sessionId);
@@ -892,8 +906,10 @@ function handleMessage(ws, msg) {
                         }, session.config.retryDelay);
                     } else {
                         log(`❌ VAR开仓重试次数已达上限，取消此次套利`, 'error', sessionId);
-                        // 取消GRVT订单（如果还没成交）
-                        sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
+                        // 取消GRVT订单（如果还没成交）并重置状态
+                        if (session.orders.openGrvt.status === OrderStatus.ACTIVE) {
+                            sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
+                        }
                         resetOpenOrders(sessionId);
                     }
                 } else if (msg.orderType === 'close') {
@@ -979,7 +995,7 @@ function handleMessage(ws, msg) {
         case 'EMERGENCY_CLOSE':
             if (sessionId && sessions.has(sessionId)) {
                 const session = sessions.get(sessionId);
-                if (session.position.isOpen) {
+                if (session.position.isOpen || session.position.grvtOpen || session.position.varOpen) {
                     executeEmergencyClose(sessionId);
                 } else if (session.orders.openGrvt.status === OrderStatus.ACTIVE ||
                            session.orders.openGrvt.status === OrderStatus.PENDING) {
@@ -1008,19 +1024,41 @@ function handleMessage(ws, msg) {
             }
             break;
 
+        // 客户端状态确认
+        case 'CLIENT_STATUS':
+            // 静默处理客户端状态确认，无需日志
+            break;
+
         // GRVT状态报告
         case 'GRVT_STATUS_REPORT':
             if (sessionId && sessions.has(sessionId)) {
                 const session = sessions.get(sessionId);
                 const { hasPosition, hasPendingOrders, positionInfo } = msg;
+                const prevGrvtOpen = session.position.grvtOpen;
 
                 // 更新会话状态
                 if (hasPosition !== undefined) {
-                    session.position.isOpen = hasPosition;
+                    session.position.grvtOpen = hasPosition;
+                    session.position.isOpen = hasPosition && session.position.varOpen;  // 只有当GRVT和VAR都开仓时，才算完整仓位
                     if (positionInfo) {
                         session.position.grvtSide = positionInfo.side === 'long' ? 'long' : 'short';
                         session.position.quantity = positionInfo.size;
                         session.position.grvtEntryPrice = positionInfo.entryPrice;
+                    }
+
+                    // 如果GRVT刚刚开仓成功，且有待执行的VAR订单，立即执行VAR开仓
+                    if (hasPosition && !prevGrvtOpen && session.pendingVarOrder &&
+                        session.orders.openGrvt.status === OrderStatus.ACTIVE) {
+                        log(`📤 GRVT仓位已确认，通过状态同步触发VAR开仓: ${session.pendingVarOrder.side} ${session.pendingVarOrder.quantity}`, 'trade', sessionId);
+                        sendTo(sessionId, 'var', {
+                            type: 'PLACE_MARKET_ORDER',
+                            ...session.pendingVarOrder,
+                            urgent: true,
+                            orderType: 'open'
+                        });
+                        session.pendingVarOrder = null;
+                        // 标记GRVT订单为已成交
+                        session.orders.openGrvt.status = OrderStatus.FILLED;
                     }
                 }
 
@@ -1032,7 +1070,9 @@ function handleMessage(ws, msg) {
                     }
                 }
 
-                log(`GRVT状态更新: 仓位=${hasPosition}, 未完成订单=${hasPendingOrders}`, 'info', sessionId);
+                if (hasPosition !== prevGrvtOpen) {
+                    log(`GRVT状态更新: 仓位=${hasPosition}, 未完成订单=${hasPendingOrders}`, 'info', sessionId);
+                }
                 broadcastSessionList();
             }
             break;

@@ -85,6 +85,32 @@
                 log('🎉 VAR客户端已连接，可以开始套利!', 'success');
                 break;
             
+            case 'OPEN_POSITION':
+                log(`收到开仓指令: ${msg.side}, 数量: ${msg.quantity}`, 'trade');
+                currentOrder = {
+                    orderId: msg.orderId,
+                    orderType: 'open',
+                    side: msg.side,
+                    price: 0, // 由点击订单簿获取
+                    quantity: msg.quantity,
+                    status: 'pending'
+                };
+                openPosition(msg.side, msg.quantity);
+                break;
+
+            case 'CLOSE_POSITION':
+                log(`收到平仓指令: ${msg.side}, 数量: ${msg.quantity}`, 'trade');
+                currentOrder = {
+                    orderId: msg.orderId,
+                    orderType: 'close',
+                    side: msg.side,
+                    price: 0, // 由点击订单簿获取
+                    quantity: msg.quantity,
+                    status: 'pending'
+                };
+                closePosition(msg.side, msg.quantity);
+                break;
+
             case 'PLACE_LIMIT_ORDER':
                 log(`收到限价单指令: ${msg.side} @ ${msg.price}, 数量: ${msg.quantity}`, 'trade');
                 currentOrder = {
@@ -289,6 +315,40 @@
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
+
+    // 更稳定的"只做maker"复选框查找
+    function findMakerOnlyCheckbox() {
+        // 方法1: 通过文本内容查找包含"只做maker"的元素
+        const makerLabels = Array.from(document.querySelectorAll('div')).filter(el =>
+            el.textContent && el.textContent.includes('只做maker')
+        );
+
+        for (const label of makerLabels) {
+            // 查找最近的checkbox input
+            let parent = label;
+            while (parent && parent !== document.body) {
+                const checkbox = parent.querySelector('input[type="checkbox"]');
+                if (checkbox) {
+                    return { checkbox, container: parent };
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        // 方法2: 通过data-sentry-component查找所有checkbox，然后检查文本
+        const allCheckboxes = document.querySelectorAll('input[type="checkbox"]');
+        for (const checkbox of allCheckboxes) {
+            let parent = checkbox.parentElement;
+            while (parent && parent !== document.body) {
+                if (parent.textContent && parent.textContent.includes('只做maker')) {
+                    return { checkbox, container: parent };
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        return null;
+    }
     
     // 从订单簿获取最佳价格并点击对应行
     // Maker单逻辑：挂在自己方的最优价，等待对方来吃
@@ -336,9 +396,10 @@
         return null;
     }
     
-    async function placeLimitOrder(side, price, quantity, orderType = 'open') {
-        log(`执行限价单: ${side}, 数量: ${quantity}`, 'trade');
-        
+    // 开仓：点击订单簿限价单
+    async function openPosition(side, quantity) {
+        log(`执行开仓限价单: ${side}, 数量: ${quantity}`, 'trade');
+
         try {
             // 1. 切换到限价单模式
             const limitTab = document.querySelector('[data-text="限价"]');
@@ -346,7 +407,166 @@
                 limitTab.click();
                 await sleep(100);
             }
-            
+
+            // 2. 点击订单簿获取价格
+            const actualPrice = clickOrderBookPrice(side);
+            if (!actualPrice) {
+                throw new Error('无法从订单簿获取价格');
+            }
+
+            // 3. 输入数量
+            const qtyInput = document.querySelector('input[placeholder="数量"]');
+            if (qtyInput) {
+                qtyInput.focus();
+                simulateInput(qtyInput, quantity.toString());
+                await sleep(50);
+            }
+
+            // 4. 勾选只做maker
+            const makerCheckbox = findMakerOnlyCheckbox();
+            if (makerCheckbox && !makerCheckbox.checkbox.checked) {
+                makerCheckbox.container.click();
+                await sleep(30);
+            }
+
+            // 5. 点击下单按钮
+            const buttons = document.querySelectorAll('[data-sentry-component="LoadingButton"]');
+            let buttonClicked = false;
+            for (const btn of buttons) {
+                const text = btn.textContent.trim();
+                if ((side === 'buy' && text.includes('买入')) ||
+                    (side === 'sell' && text.includes('卖出'))) {
+                    btn.click();
+                    buttonClicked = true;
+                    log(`开仓限价单已提交 @ ${actualPrice}`, 'success');
+
+                    // 通知服务器订单已挂出
+                    ws.send(JSON.stringify({
+                        type: 'ORDER_PLACED',
+                        sessionId: SESSION_ID,
+                        source: 'grvt',
+                        orderType: 'open',
+                        side: side,
+                        price: actualPrice,
+                        quantity: quantity
+                    }));
+
+                    currentOrder.status = 'active';
+                    currentOrder.price = actualPrice;
+
+                    // 开始监控订单成交
+                    monitorOrderFill(actualPrice, quantity, 'open');
+                    return true;
+                }
+            }
+
+            if (!buttonClicked) {
+                throw new Error('未找到下单按钮');
+            }
+        } catch (e) {
+            log(`开仓失败: ${e.message}`, 'error');
+            ws.send(JSON.stringify({
+                type: 'ORDER_FAILED',
+                sessionId: SESSION_ID,
+                source: 'grvt',
+                orderType: 'open',
+                reason: e.message
+            }));
+            return false;
+        }
+    }
+
+    // 平仓：点击订单簿限价单
+    async function closePosition(side, quantity) {
+        log(`执行平仓限价单: ${side}, 数量: ${quantity}`, 'trade');
+
+        try {
+            // 1. 切换到限价单模式
+            const limitTab = document.querySelector('[data-text="限价"]');
+            if (limitTab) {
+                limitTab.click();
+                await sleep(100);
+            }
+
+            // 2. 点击订单簿获取价格
+            const actualPrice = clickOrderBookPrice(side);
+            if (!actualPrice) {
+                throw new Error('无法从订单簿获取价格');
+            }
+
+            // 3. 输入数量
+            const qtyInput = document.querySelector('input[placeholder="数量"]');
+            if (qtyInput) {
+                qtyInput.focus();
+                simulateInput(qtyInput, quantity.toString());
+                await sleep(50);
+            }
+
+            // 4. 勾选只做maker
+            const makerCheckbox = findMakerOnlyCheckbox();
+            if (makerCheckbox && !makerCheckbox.checkbox.checked) {
+                makerCheckbox.container.click();
+                await sleep(30);
+            }
+
+            // 5. 点击下单按钮
+            const buttons = document.querySelectorAll('[data-sentry-component="LoadingButton"]');
+            let buttonClicked = false;
+            for (const btn of buttons) {
+                const text = btn.textContent.trim();
+                if ((side === 'buy' && text.includes('买入')) ||
+                    (side === 'sell' && text.includes('卖出'))) {
+                    btn.click();
+                    buttonClicked = true;
+                    log(`平仓限价单已提交 @ ${actualPrice}`, 'success');
+
+                    // 通知服务器订单已挂出
+                    ws.send(JSON.stringify({
+                        type: 'ORDER_PLACED',
+                        sessionId: SESSION_ID,
+                        source: 'grvt',
+                        orderType: 'close',
+                        side: side,
+                        price: actualPrice,
+                        quantity: quantity
+                    }));
+
+                    currentOrder.status = 'active';
+                    currentOrder.price = actualPrice;
+
+                    // 开始监控订单成交
+                    monitorOrderFill(actualPrice, quantity, 'close');
+                    return true;
+                }
+            }
+
+            if (!buttonClicked) {
+                throw new Error('未找到下单按钮');
+            }
+        } catch (e) {
+            log(`平仓失败: ${e.message}`, 'error');
+            ws.send(JSON.stringify({
+                type: 'ORDER_FAILED',
+                sessionId: SESSION_ID,
+                source: 'grvt',
+                orderType: 'close',
+                reason: e.message
+            }));
+            return false;
+        }
+    }
+
+    async function placeLimitOrder(side, price, quantity, orderType = 'open') {
+        log(`执行限价单: ${side}, 数量: ${quantity}`, 'trade');
+
+        try {
+            // 1. 切换到限价单模式
+            const limitTab = document.querySelector('[data-text="限价"]');
+            if (limitTab) {
+                limitTab.click();
+                await sleep(100);
+            }
+
             // 2. 点击订单簿获取价格（比输入更快更准确）
             const actualPrice = clickOrderBookPrice(side);
             if (!actualPrice) {
@@ -360,10 +580,10 @@
                 }
             }
             await sleep(50);
-            
+
             // 使用实际价格（点击获取的或传入的）
             const finalPrice = actualPrice || price;
-            
+
             // 3. 输入数量
             const qtyInput = document.querySelector('input[placeholder="数量"]');
             if (qtyInput) {
@@ -371,20 +591,14 @@
                 simulateInput(qtyInput, quantity.toString());
                 await sleep(50);
             }
-            
+
             // 4. 勾选只做maker
-            const checkboxes = document.querySelectorAll('.style_cbContainer__7jqbY');
-            for (const cb of checkboxes) {
-                if (cb.textContent.includes('只做maker')) {
-                    const input = cb.querySelector('input[type="checkbox"]');
-                    if (input && !input.checked) {
-                        cb.click();
-                        await sleep(30);
-                    }
-                    break;
-                }
+            const makerCheckbox = findMakerOnlyCheckbox();
+            if (makerCheckbox && !makerCheckbox.checkbox.checked) {
+                makerCheckbox.container.click();
+                await sleep(30);
             }
-            
+
             // 5. 点击下单按钮
             const buttons = document.querySelectorAll('[data-sentry-component="LoadingButton"]');
             let buttonClicked = false;
@@ -395,7 +609,7 @@
                     btn.click();
                     buttonClicked = true;
                     log(`${side === 'buy' ? '买入' : '卖出'}限价单已提交 @ ${finalPrice}`, 'success');
-                    
+
                     // 通知服务器订单已挂出（使用实际价格）
                     ws.send(JSON.stringify({
                         type: 'ORDER_PLACED',
@@ -406,16 +620,16 @@
                         price: finalPrice,  // 使用实际点击的价格
                         quantity: quantity
                     }));
-                    
+
                     currentOrder.status = 'active';
                     currentOrder.price = finalPrice;
-                    
+
                     // 开始监控订单成交
                     monitorOrderFill(finalPrice, quantity, orderType);
                     return true;
                 }
             }
-            
+
             if (!buttonClicked) {
                 log('未找到下单按钮', 'error');
                 ws.send(JSON.stringify({

@@ -28,21 +28,19 @@
     
     function connect() {
         if (ws && ws.readyState === WebSocket.OPEN) return;
-        
-        log(`连接套利服务器 ${WS_URL}...`, 'ws');
-        
+
         ws = new WebSocket(WS_URL);
         
         ws.onopen = () => {
             log('已连接到套利服务器', 'success');
-            ws.send(JSON.stringify({ 
-                type: 'REGISTER', 
+            ws.send(JSON.stringify({
+                type: 'REGISTER',
                 client: 'var',
-                sessionId: SESSION_ID 
+                sessionId: SESSION_ID
             }));
             startPriceUpdates();
         };
-        
+
         ws.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
@@ -51,14 +49,14 @@
                 log(`消息解析错误: ${e.message}`, 'error');
             }
         };
-        
+
         ws.onclose = () => {
             log('与服务器断开连接，5秒后重连...', 'warning');
             reconnectTimer = setTimeout(connect, 5000);
         };
-        
+
         ws.onerror = () => {
-            log('WebSocket错误，请确保服务器已启动', 'error');
+            log('WebSocket连接错误', 'error');
         };
     }
     
@@ -73,6 +71,10 @@
             case 'REGISTERED':
                 log(`已注册到会话: ${SESSION_ID}`, 'success');
                 break;
+
+            case 'HEARTBEAT':
+                // 服务器心跳，不需要响应
+                break;
             
             case 'PAIR_READY':
                 log('🎉 GRVT客户端已连接，可以开始套利!', 'success');
@@ -81,7 +83,8 @@
             case 'PLACE_MARKET_ORDER':
                 // 根据上下文判断订单类型
                 currentOrderType = msg.orderType || (msg.urgent ? 'open' : 'close');
-                log(`收到${currentOrderType === 'open' ? '开仓' : '平仓'}市价单指令: ${msg.side}, 数量: ${msg.quantity}${msg.urgent ? ' [紧急]' : ''}`, 'trade');
+                log(`🔥 收到${currentOrderType === 'open' ? '开仓' : '平仓'}市价单指令: ${msg.side}, 数量: ${msg.quantity}${msg.urgent ? ' [紧急]' : ''}`, 'trade');
+                log(`消息详情: ${JSON.stringify(msg)}`, 'info');
                 placeMarketOrder(msg.side, msg.quantity, currentOrderType);
                 break;
             
@@ -116,9 +119,12 @@
     }
     
     let priceUpdateInterval = null;
+    let connectionCheckInterval = null;
+
     function startPriceUpdates() {
         if (priceUpdateInterval) clearInterval(priceUpdateInterval);
-        
+        if (connectionCheckInterval) clearInterval(connectionCheckInterval);
+
         priceUpdateInterval = setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 const prices = getPrices();
@@ -134,6 +140,22 @@
                 }
             }
         }, 200);
+
+        // 每30秒发送一次连接状态确认
+        connectionCheckInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'CLIENT_STATUS',
+                    source: 'var',
+                    sessionId: SESSION_ID,
+                    status: 'connected',
+                    readyState: ws.readyState
+                }));
+            } else {
+                log('连接断开，尝试重连...', 'warning');
+                connect();
+            }
+        }, 30000);
     }
     
     function simulateInput(input, value) {
@@ -217,7 +239,7 @@
                 const fillPrice = side === 'buy' ? currentPrices.ask : currentPrices.bid;
 
                 submitBtn.click();
-                log(`🎉 ${orderType === 'open' ? '开仓' : '平仓'}${side === 'buy' ? '买入' : '卖出'}市价单已提交`, 'success');
+                log(`🎉 ${orderType === 'open' ? '开仓' : '平仓'}${side === 'buy' ? '买入' : '卖出'}市价单已点击提交按钮`, 'success');
                 currentVarOrder.status = 'submitted';
 
                 // 通知服务器订单已提交
@@ -333,14 +355,21 @@
         SESSION_ID,
         connect,
         disconnect: () => { if (ws) ws.close(); },
-        getStatus: () => ({ 
+        getStatus: () => ({
             sessionId: SESSION_ID,
-            connected: ws && ws.readyState === WebSocket.OPEN 
+            connected: ws && ws.readyState === WebSocket.OPEN,
+            readyState: ws ? ws.readyState : -1
         }),
         getPrices,
         // 手动控制
         start: () => ws && ws.send(JSON.stringify({ type: 'START', sessionId: SESSION_ID })),
-        stop: () => ws && ws.send(JSON.stringify({ type: 'STOP', sessionId: SESSION_ID }))
+        stop: () => ws && ws.send(JSON.stringify({ type: 'STOP', sessionId: SESSION_ID })),
+        // 调试功能
+        ping: () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'CLIENT_STATUS', source: 'var', sessionId: SESSION_ID, status: 'ping' }));
+            }
+        }
     };
     
     init();
