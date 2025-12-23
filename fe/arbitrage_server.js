@@ -1042,7 +1042,12 @@ function handleMessage(ws, msg) {
                     session.position.isOpen = hasPosition && session.position.varOpen;  // 只有当GRVT和VAR都开仓时，才算完整仓位
                     if (positionInfo) {
                         session.position.grvtSide = positionInfo.side === 'long' ? 'long' : 'short';
-                        session.position.quantity = positionInfo.size;
+                        // 只在数量合理的情况下更新（避免GRVT报告错误的价值数据）
+                        if (positionInfo.size > 0 && positionInfo.size <= session.config.orderSize * 2) {
+                            session.position.quantity = positionInfo.size;
+                        } else {
+                            log(`GRVT报告的仓位大小异常: ${positionInfo.size}，保持原有数量: ${session.position.quantity}`, 'warning', sessionId);
+                        }
                         session.position.grvtEntryPrice = positionInfo.entryPrice;
                     }
 

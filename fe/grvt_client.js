@@ -807,12 +807,15 @@
             // GRVT仓位表格结构（基于实际DOM分析）:
             // 0: 交易对 (BTC)
             // 1: 杠杆信息 (Cross 50x) - 包含方向信息
-            // 2: 仓位大小 (-0.003 BTC)
+            // 2: 仓位大小 (-0.003 BTC) 或 仓位价值 (263.99 USDT)
             // 3: 盈亏 (-268.57)
             // 4: 标记价 (89,571.1)
             // 5: 开仓价 (89,509.2)
             // 6: 强平价 (91,587.2)
             // 7+: 其他字段
+
+            // 注意：第2列可能是"仓位大小"（合约数量）或"仓位价值"（美元价值）
+            // 我们需要的是合约数量，不是美元价值
 
             let symbol = '';
             let side = 'unknown';
@@ -832,9 +835,28 @@
 
             // 解析仓位大小 (格式如: -0.003 BTC 或 0.003 BTC)
             if (cellTexts[2]) {
-                const sizeMatch = cellTexts[2].match(/([+-]?\d+\.?\d*)/);
+                log(`解析仓位大小文本: "${cellTexts[2]}"`, 'info');
+                // 匹配数字部分，忽略货币单位
+                const sizeMatch = cellTexts[2].match(/([+-]?\d+\.?\d*)\s*[A-Z]*/);
                 if (sizeMatch) {
                     size = parseFloat(sizeMatch[1]);
+                    log(`解析得到仓位大小: ${size}`, 'info');
+
+                    // 验证大小是否合理（合约数量不应该超过1）
+                    if (size > 1) {
+                        log(`仓位大小异常(${size})，可能解析到的是美元价值而不是合约数量`, 'warning');
+                        // 如果大小太大，尝试查找真正的合约数量列
+                        for (let i = 0; i < cellTexts.length; i++) {
+                            const text = cellTexts[i];
+                            const contractMatch = text.match(/([+-]?\d+\.?\d*)\s*BTC/);
+                            if (contractMatch && Math.abs(parseFloat(contractMatch[1])) <= 1) {
+                                size = Math.abs(parseFloat(contractMatch[1]));
+                                log(`找到正确的合约数量: ${size}`, 'info');
+                                break;
+                            }
+                        }
+                    }
+
                     // 根据正负号判断多空方向
                     if (size > 0) {
                         side = 'long';
@@ -842,6 +864,8 @@
                         side = 'short';
                         size = Math.abs(size); // 转为正数
                     }
+                } else {
+                    log(`无法解析仓位大小: ${cellTexts[2]}`, 'warning');
                 }
             }
 
