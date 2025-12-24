@@ -94,9 +94,10 @@
             case 'PLACE_MARKET_ORDER':
                 // 根据上下文判断订单类型
                 currentOrderType = msg.orderType || (msg.urgent ? 'open' : 'close');
-                log(`🔥 收到${currentOrderType === 'open' ? '开仓' : '平仓'}市价单指令: ${msg.side}, 数量: ${msg.quantity}${msg.urgent ? ' [紧急]' : ''}`, 'trade');
+                const isRetry = msg.retry === true;
+                log(`🔥 收到${currentOrderType === 'open' ? '开仓' : '平仓'}市价单指令: ${msg.side}, 数量: ${msg.quantity}${msg.urgent ? ' [紧急]' : ''}${isRetry ? ' [重试]' : ''}`, 'trade');
                 log(`消息详情: ${JSON.stringify(msg)}`, 'info');
-                placeMarketOrder(msg.side, msg.quantity, currentOrderType);
+                placeMarketOrder(msg.side, msg.quantity, currentOrderType, isRetry);
                 break;
             
             case 'STATUS':
@@ -192,8 +193,8 @@
         status: 'none'
     };
 
-    async function placeMarketOrder(side, quantity, orderType = 'open') {
-        log(`执行${orderType === 'open' ? '开仓' : '平仓'}市价单: ${side}, 数量: ${quantity}`, 'trade');
+    async function placeMarketOrder(side, quantity, orderType = 'open', isRetry = false) {
+        log(`执行${orderType === 'open' ? '开仓' : '平仓'}市价单: ${side}, 数量: ${quantity}${isRetry ? ' [重试]' : ''}`, 'trade');
 
         // 检查是否有正在进行的订单，防止重复下单
         if (currentVarOrder.status === 'pending' || currentVarOrder.status === 'submitted') {
@@ -202,7 +203,8 @@
         }
 
         // 如果是相同的订单类型和参数，可能是重复指令，直接返回
-        if (currentVarOrder.orderType === orderType &&
+        // 但是如果是重试指令，则允许通过
+        if (!isRetry && currentVarOrder.orderType === orderType &&
             currentVarOrder.side === side &&
             currentVarOrder.quantity === quantity &&
             (currentVarOrder.status === 'filled' || currentVarOrder.status === 'failed')) {

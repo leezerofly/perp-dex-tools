@@ -995,13 +995,14 @@ function handleMessage(ws, msg) {
                     if (retryCount < session.config.maxRetries) {
                         log(`🔄 重新发送VAR开仓指令...`, 'warning', sessionId);
                         setTimeout(() => {
-                            sendTo(sessionId, 'var', {
-                                type: 'PLACE_MARKET_ORDER',
-                                side: session.pendingVarOrder?.side || msg.side,
-                                quantity: session.pendingVarOrder?.quantity || msg.quantity,
-                                orderType: 'open',
-                                urgent: true
-                            });
+                        sendTo(sessionId, 'var', {
+                            type: 'PLACE_MARKET_ORDER',
+                            side: session.pendingVarOrder?.side || msg.side,
+                            quantity: session.pendingVarOrder?.quantity || msg.quantity,
+                            orderType: 'open',
+                            urgent: true,
+                            retry: true  // 标记为重试指令
+                        });
                         }, session.config.retryDelay);
                     } else {
                         log(`❌ VAR开仓重试次数已达上限，GRVT已开仓，执行限价平仓`, 'error', sessionId);
@@ -1031,7 +1032,8 @@ function handleMessage(ws, msg) {
                                 side: pos.varSide === 'long' ? 'sell' : 'buy',
                                 quantity: pos.quantity,
                                 orderType: 'close',
-                                urgent: true
+                                urgent: true,
+                                retry: true  // 标记为重试指令
                             });
                         }, session.config.retryDelay);
                     } else {
@@ -1057,7 +1059,8 @@ function handleMessage(ws, msg) {
                             side: msg.side,
                             quantity: msg.quantity,
                             orderType: 'open',
-                            urgent: true
+                            urgent: true,
+                            retry: true  // 标记为重试指令
                         });
                     } else if (msg.orderType === 'close' && session.orders.closeVar.status !== OrderStatus.FILLED) {
                         log(`⏰ VAR平仓订单确认超时，重新发送...`, 'warning', sessionId);
@@ -1067,7 +1070,8 @@ function handleMessage(ws, msg) {
                             side: pos.varSide === 'long' ? 'sell' : 'buy',
                             quantity: pos.quantity,
                             orderType: 'close',
-                            urgent: true
+                            urgent: true,
+                            retry: true  // 标记为重试指令
                         });
                     }
                 }, 3000); // 3秒后检查
@@ -1306,7 +1310,8 @@ setInterval(() => {
                     sendTo(sessionId, 'var', {
                         type: 'PLACE_MARKET_ORDER',
                         ...session.pendingVarOrder,
-                        urgent: true
+                        urgent: true,
+                        retry: true  // 标记为重试指令
                     });
                 }
             }
@@ -1327,7 +1332,8 @@ setInterval(() => {
                         side: pos.varSide === 'long' ? 'sell' : 'buy',
                         quantity: pos.quantity,
                         orderType: 'close',
-                        urgent: true
+                        urgent: true,
+                        retry: true  // 标记为重试指令
                     });
                 }
             }
