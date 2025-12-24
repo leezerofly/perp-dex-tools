@@ -330,19 +330,112 @@
         }
     }
 
-    // 检查订单是否成交（简化版，需要根据实际DOM调整）
+    // 检查订单是否成交
     async function checkOrderFilled(orderType) {
-        // 这里应该检查是否有成交记录或余额变化
-        // 暂时用简单的时间延迟模拟
-        await sleep(1000);
+        // 记录检查开始时的仓位状态
+        const initialPositions = getCurrentPositions();
+        await sleep(500); // 等待交易执行
 
-        // 实际应该检查：
-        // 1. 成交历史记录
-        // 2. 余额变化
-        // 3. 仓位变化
+        let attempts = 0;
+        const maxAttempts = 10; // 最多检查10次
+        const checkInterval = 500; // 每500ms检查一次
 
-        // 暂时返回true，假设成交成功
-        return true;
+        while (attempts < maxAttempts) {
+            await sleep(checkInterval);
+            const currentPositions = getCurrentPositions();
+
+            // 检查是否有仓位变化
+            if (orderType === 'open') {
+                // 开仓：检查是否新增了仓位
+                if (hasPositionOpened(initialPositions, currentPositions)) {
+                    log(`✅ 检测到开仓成交，仓位已建立`, 'success');
+                    return true;
+                }
+            } else if (orderType === 'close') {
+                // 平仓：检查仓位是否减少或清零
+                if (hasPositionClosed(initialPositions, currentPositions)) {
+                    log(`✅ 检测到平仓成交，仓位已关闭`, 'success');
+                    return true;
+                }
+            }
+
+            attempts++;
+        }
+
+        log(`⚠️ 未检测到仓位变化，可能成交失败或延迟`, 'warning');
+        return false;
+    }
+
+    // 获取当前仓位信息
+    function getCurrentPositions() {
+        const positions = [];
+
+        // 查找仓位表格中的行
+        const positionRows = document.querySelectorAll('[data-testid*="position-row"], tr, .position-item');
+
+        // 如果没找到特定的选择器，尝试查找包含交易对信息的元素
+        if (positionRows.length === 0) {
+            // 查找所有包含"XRP"或其他交易对名称的元素
+            const allElements = document.querySelectorAll('*');
+            for (const el of allElements) {
+                const text = el.textContent || '';
+                if (text.includes('XRP') && text.match(/[\d.]+/)) {
+                    // 尝试提取数量信息
+                    const qtyMatch = text.match(/([\d.]+)\s*XRP/);
+                    if (qtyMatch) {
+                        positions.push({
+                            symbol: 'XRP',
+                            quantity: parseFloat(qtyMatch[1]),
+                            element: el
+                        });
+                    }
+                }
+            }
+        } else {
+            // 解析表格行
+            positionRows.forEach(row => {
+                const cells = row.querySelectorAll('td, div');
+                if (cells.length >= 2) {
+                    const symbol = cells[0]?.textContent?.trim();
+                    const qtyText = cells[1]?.textContent?.trim();
+                    if (symbol && qtyText) {
+                        const quantity = parseFloat(qtyText.replace(/[^\d.-]/g, ''));
+                        if (!isNaN(quantity) && quantity !== 0) {
+                            positions.push({
+                                symbol: symbol.replace('/USDT', '').replace('PERP', ''),
+                                quantity: Math.abs(quantity),
+                                element: row
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
+        return positions;
+    }
+
+    // 检查是否开仓成功（新增了仓位）
+    function hasPositionOpened(initialPositions, currentPositions) {
+        // 如果初始时没有仓位，现在有了仓位
+        if (initialPositions.length === 0 && currentPositions.length > 0) {
+            return true;
+        }
+
+        // 如果初始仓位数量为0，现在有非零仓位
+        const initialTotalQty = initialPositions.reduce((sum, pos) => sum + Math.abs(pos.quantity), 0);
+        const currentTotalQty = currentPositions.reduce((sum, pos) => sum + Math.abs(pos.quantity), 0);
+
+        return currentTotalQty > initialTotalQty;
+    }
+
+    // 检查是否平仓成功（仓位减少或清零）
+    function hasPositionClosed(initialPositions, currentPositions) {
+        const initialTotalQty = initialPositions.reduce((sum, pos) => sum + Math.abs(pos.quantity), 0);
+        const currentTotalQty = currentPositions.reduce((sum, pos) => sum + Math.abs(pos.quantity), 0);
+
+        // 仓位总量减少
+        return currentTotalQty < initialTotalQty;
     }
     
     function init() {

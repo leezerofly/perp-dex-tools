@@ -349,7 +349,40 @@
 
         return null;
     }
-    
+
+    function findReduceOnlyCheckbox() {
+        // 方法1: 通过文本内容查找包含"只减仓"的元素
+        const reduceLabels = Array.from(document.querySelectorAll('div')).filter(el =>
+            el.textContent && el.textContent.includes('只减仓')
+        );
+
+        for (const label of reduceLabels) {
+            // 查找最近的checkbox input
+            let parent = label;
+            while (parent && parent !== document.body) {
+                const checkbox = parent.querySelector('input[type="checkbox"]');
+                if (checkbox) {
+                    return { checkbox, container: parent };
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        // 方法2: 通过data-sentry-component查找所有checkbox，然后检查文本
+        const allCheckboxes = document.querySelectorAll('input[type="checkbox"]');
+        for (const checkbox of allCheckboxes) {
+            let parent = checkbox.parentElement;
+            while (parent && parent !== document.body) {
+                if (parent.textContent && parent.textContent.includes('只减仓')) {
+                    return { checkbox, container: parent };
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        return null;
+    }
+
     // 从订单簿获取最佳价格并点击对应行
     // Maker单逻辑：挂在自己方的最优价，等待对方来吃
     function clickOrderBookPrice(side) {
@@ -506,6 +539,13 @@
             const makerCheckbox = findMakerOnlyCheckbox();
             if (makerCheckbox && !makerCheckbox.checkbox.checked) {
                 makerCheckbox.container.click();
+                await sleep(30);
+            }
+
+            // 4.1. 勾选只减仓
+            const reduceOnlyCheckbox = findReduceOnlyCheckbox();
+            if (reduceOnlyCheckbox && !reduceOnlyCheckbox.checkbox.checked) {
+                reduceOnlyCheckbox.container.click();
                 await sleep(30);
             }
 

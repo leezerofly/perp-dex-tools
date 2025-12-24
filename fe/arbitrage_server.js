@@ -20,6 +20,25 @@ const OrderStatus = {
     FAILED: 'failed'         // 失败
 };
 
+// 程序休眠
+function sleepProgram(sessionId, durationMs) {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+
+    session.isRunning = false;
+    log(`😴 程序进入休眠状态 ${durationMs / 1000 / 60} 分钟...`, 'warning', sessionId);
+
+    // 通知所有客户端停止
+    broadcastToSession(sessionId, { type: 'STOP' });
+
+    // 设置定时器重新启动
+    setTimeout(() => {
+        log('🌅 休眠结束，重新启动程序', 'info', sessionId);
+        session.isRunning = true;
+        broadcastToSession(sessionId, { type: 'START' });
+    }, durationMs);
+}
+
 // 创建新会话
 function createSession(sessionId) {
     return {
@@ -541,6 +560,34 @@ function retryCloseGrvtOrder(sessionId) {
     });
 }
 
+// GRVT限价平仓 (用于VAR失败时的紧急处理)
+function executeLimitCloseGrvt(sessionId) {
+    const session = sessions.get(sessionId);
+    if (!session || !session.position.grvtOpen || !session.position.grvtSide) return;
+
+    log('🚨 VAR开仓失败，执行GRVT限价平仓...', 'warning', sessionId);
+    const pos = session.position;
+
+    // 发送GRVT限价平仓指令
+    sendTo(sessionId, 'grvt', {
+        type: 'PLACE_LIMIT_ORDER',
+        orderId: `emergency_close_${sessionId}_${Date.now()}`,
+        side: pos.grvtSide === 'long' ? 'sell' : 'buy',
+        quantity: pos.quantity,
+        orderType: 'close'
+    });
+
+    // 等待平仓完成后休眠程序
+    setTimeout(() => {
+        if (session.position.grvtOpen) {
+            log('GRVT仓位仍未平仓，强制休眠程序2小时', 'error', sessionId);
+        } else {
+            log('GRVT仓位已平仓，休眠程序2小时后重启', 'info', sessionId);
+        }
+        sleepProgram(sessionId, 2 * 60 * 60 * 1000); // 2小时
+    }, 30000); // 30秒后检查
+}
+
 // 紧急平仓 (市价单)
 function executeEmergencyClose(sessionId) {
     const session = sessions.get(sessionId);
@@ -804,16 +851,28 @@ function handleMessage(ws, msg) {
                     // 平仓订单成交
                     log(`✅ GRVT平仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.closeGrvt.status = OrderStatus.FILLED;
-                    
-                    // 立即执行VAR平仓
-                    const pos = session.position;
-                    log(`📤 发送VAR平仓市价单...`, 'trade', sessionId);
-                    sendTo(sessionId, 'var', {
-                        type: 'PLACE_MARKET_ORDER',
-                        side: pos.varSide === 'long' ? 'sell' : 'buy',
-                        quantity: pos.quantity,
-                        urgent: true
-                    });
+
+                    // 检查是否为VAR失败导致的紧急平仓
+                    const isEmergencyClose = msg.orderId && msg.orderId.includes('emergency_close');
+
+                    if (isEmergencyClose) {
+                        // 紧急平仓完成，休眠程序2小时
+                        log('🚨 紧急平仓完成，程序休眠2小时', 'warning', sessionId);
+                        session.position.grvtOpen = false;
+                        session.position.varOpen = false;
+                        session.position.isOpen = false;
+                        sleepProgram(sessionId, 2 * 60 * 60 * 1000); // 2小时
+                    } else {
+                        // 正常平仓流程，执行VAR平仓
+                        const pos = session.position;
+                        log(`📤 发送VAR平仓市价单...`, 'trade', sessionId);
+                        sendTo(sessionId, 'var', {
+                            type: 'PLACE_MARKET_ORDER',
+                            side: pos.varSide === 'long' ? 'sell' : 'buy',
+                            quantity: pos.quantity,
+                            urgent: true
+                        });
+                    }
                 }
             }
             break;
@@ -905,12 +964,18 @@ function handleMessage(ws, msg) {
                             });
                         }, session.config.retryDelay);
                     } else {
-                        log(`❌ VAR开仓重试次数已达上限，取消此次套利`, 'error', sessionId);
-                        // 取消GRVT订单（如果还没成交）并重置状态
-                        if (session.orders.openGrvt.status === OrderStatus.ACTIVE) {
-                            sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
+                        log(`❌ VAR开仓重试次数已达上限，GRVT已开仓，执行限价平仓`, 'error', sessionId);
+
+                        // 如果GRVT已经开仓成功，限价平仓GRVT仓位
+                        if (session.position.grvtOpen && session.position.grvtSide) {
+                            executeLimitCloseGrvt(sessionId);
+                        } else {
+                            // 如果GRVT还没开仓，只取消订单
+                            if (session.orders.openGrvt.status === OrderStatus.ACTIVE) {
+                                sendTo(sessionId, 'grvt', { type: 'CANCEL_ORDER', orderType: 'open' });
+                            }
+                            resetOpenOrders(sessionId);
                         }
-                        resetOpenOrders(sessionId);
                     }
                 } else if (msg.orderType === 'close') {
                     log(`❌ VAR平仓订单失败: ${msg.reason} (重试${retryCount}次)`, 'error', sessionId);
