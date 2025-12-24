@@ -50,7 +50,9 @@ function createSession(sessionId) {
             controller: null
         },
         isRunning: false,
-        
+        isWaitingInterval: false,  // 是否正在等待套利间隔
+        intervalWaitEndTime: null, // 间隔等待结束时间
+
         // 仓位信息
         position: {
             isOpen: false,
@@ -119,6 +121,9 @@ function createSession(sessionId) {
             // === 持仓时间控制 ===
             minHoldMinutes: 15,           // 最小持仓时间(分钟)
             maxHoldMinutes: 20,           // 最大持仓时间(分钟)
+
+            // === 套利间隔控制 ===
+            arbitrageIntervalSeconds: 10, // 两次套利间的间隔时间(秒)，0=无间隔
 
             // === 订单超时设置 ===
             orderTimeout: 30000,          // 限价单超时(ms)，超时后取消重挂
@@ -295,6 +300,9 @@ function calcRoundTripProfit(session, side, quantity) {
 function checkOpenOpportunity(sessionId) {
     const session = sessions.get(sessionId);
     if (!session || !session.isRunning) return;
+
+    // 如果正在等待套利间隔，跳过开仓检查
+    if (session.isWaitingInterval) return;
 
     // 如果已有完整仓位或GRVT正在开仓，跳过
     if (session.position.isOpen || session.position.grvtOpen) return;
@@ -662,6 +670,8 @@ function getAllSessionsStatus() {
             id: session.id,
             name: session.name,
             isRunning: session.isRunning,
+            isWaitingInterval: session.isWaitingInterval,
+            intervalWaitEndTime: session.intervalWaitEndTime,
             position: session.position,
             prices: session.prices,
             config: session.config,
@@ -950,7 +960,23 @@ function handleMessage(ws, msg) {
                     session.orders.closeVar.status = OrderStatus.FILLED;
 
                     log(`🎉 套利仓位已平仓!`, 'success', sessionId);
-                    resetPosition(sessionId);
+
+                    // 检查是否有套利间隔设置
+                    const intervalSeconds = session.config.arbitrageIntervalSeconds;
+                    if (intervalSeconds > 0) {
+                        log(`⏳ 开始套利间隔等待 ${intervalSeconds} 秒...`, 'info', sessionId);
+                        session.isWaitingInterval = true;
+                        session.intervalWaitEndTime = Date.now() + (intervalSeconds * 1000);
+
+                        setTimeout(() => {
+                            session.isWaitingInterval = false;
+                            session.intervalWaitEndTime = null;
+                            log(`✅ 套利间隔等待完成，可以开始下一次套利`, 'success', sessionId);
+                            resetPosition(sessionId);
+                        }, intervalSeconds * 1000);
+                    } else {
+                        resetPosition(sessionId);
+                    }
                 }
             }
             break;
