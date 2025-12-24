@@ -610,7 +610,8 @@ function executeEmergencyClose(sessionId) {
         sendTo(sessionId, 'var', {
             type: 'PLACE_MARKET_ORDER',
             side: pos.varSide === 'long' ? 'sell' : 'buy',
-            quantity: pos.quantity
+            quantity: pos.quantity,
+            orderType: 'close'
         });
     }
 
@@ -882,6 +883,7 @@ function handleMessage(ws, msg) {
                             type: 'PLACE_MARKET_ORDER',
                             side: pos.varSide === 'long' ? 'sell' : 'buy',
                             quantity: pos.quantity,
+                            orderType: 'close',
                             urgent: true
                         });
                     }
