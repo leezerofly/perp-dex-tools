@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         var_client
+// @namespace    http://tampermonkey.net/
+// @version      2025-12-22
+// @description  try to take over the world!
+// @author       You
+// @match        https://omni.variational.io/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=variational.io
+// @grant        none
+// ==/UserScript==
+
 // ========== VAR 标签页客户端脚本 (多会话版) ==========
 // 在VAR (Variational) 交易页面的控制台运行此脚本
 // 需要指定 SESSION_ID 与对应的GRVT客户端配对

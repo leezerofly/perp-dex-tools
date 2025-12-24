@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         grvt_client
+// @namespace    http://tampermonkey.net/
+// @version      2025-12-22
+// @description  try to take over the world!
+// @author       You
+// @match        https://grvt.io/exchange/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=grvt.io
+// @grant        none
+// ==/UserScript==
+
 // ========== GRVT 标签页客户端脚本 (多会话版) ==========
 // 在GRVT交易页面的控制台运行此脚本
 // 需要指定 SESSION_ID 与对应的VAR客户端配对
