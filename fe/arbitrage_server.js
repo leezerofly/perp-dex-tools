@@ -828,6 +828,12 @@ function handleMessage(ws, msg) {
                 const session = sessions.get(sessionId);
 
                 if (msg.orderType === 'open') {
+                    // 检查是否已经处理过这个订单成交，避免重复处理
+                    if (session.orders.openGrvt.status === OrderStatus.FILLED) {
+                        log(`⚠️ GRVT开仓订单已成交，忽略重复的成交消息`, 'warning', sessionId);
+                        return;
+                    }
+
                     // 开仓订单成交
                     log(`✅ GRVT开仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.openGrvt.status = OrderStatus.FILLED;
@@ -848,6 +854,12 @@ function handleMessage(ws, msg) {
                         log(`⚠️ GRVT开仓成交但没有待执行的VAR订单`, 'warning', sessionId);
                     }
                 } else if (msg.orderType === 'close') {
+                    // 检查是否已经处理过这个平仓订单成交，避免重复处理
+                    if (session.orders.closeGrvt.status === OrderStatus.FILLED) {
+                        log(`⚠️ GRVT平仓订单已成交，忽略重复的成交消息`, 'warning', sessionId);
+                        return;
+                    }
+
                     // 平仓订单成交
                     log(`✅ GRVT平仓成交 @ ${msg.price}`, 'success', sessionId);
                     session.orders.closeGrvt.status = OrderStatus.FILLED;

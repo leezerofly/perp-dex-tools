@@ -195,6 +195,21 @@
     async function placeMarketOrder(side, quantity, orderType = 'open') {
         log(`执行${orderType === 'open' ? '开仓' : '平仓'}市价单: ${side}, 数量: ${quantity}`, 'trade');
 
+        // 检查是否有正在进行的订单，防止重复下单
+        if (currentVarOrder.status === 'pending' || currentVarOrder.status === 'submitted') {
+            log(`⚠️ 已有正在进行的VAR订单(${currentVarOrder.orderId})，忽略新的${orderType}指令`, 'warning');
+            return false;
+        }
+
+        // 如果是相同的订单类型和参数，可能是重复指令，直接返回
+        if (currentVarOrder.orderType === orderType &&
+            currentVarOrder.side === side &&
+            currentVarOrder.quantity === quantity &&
+            (currentVarOrder.status === 'filled' || currentVarOrder.status === 'failed')) {
+            log(`⚠️ 相同订单已完成(${currentVarOrder.orderId})，忽略重复指令`, 'warning');
+            return false;
+        }
+
         // 更新当前订单状态
         const orderId = `var_${orderType}_${Date.now()}`;
         currentVarOrder = {
@@ -202,7 +217,7 @@
             orderType: orderType,
             side: side,
             quantity: quantity,
-            retryCount: currentVarOrder.retryCount || 0,
+            retryCount: 0,  // 重置重试计数
             createdAt: Date.now(),
             status: 'pending'
         };
@@ -290,6 +305,23 @@
                             quantity: quantity
                         }));
                     }
+
+                    // 订单完成后延迟重置状态，确保服务器已收到成交确认
+                    setTimeout(() => {
+                        if (currentVarOrder.orderId === orderId) {
+                            log(`清理已完成的订单状态: ${orderId}`, 'info');
+                            currentVarOrder = {
+                                orderId: null,
+                                orderType: null,
+                                side: null,
+                                quantity: 0,
+                                retryCount: 0,
+                                createdAt: null,
+                                status: 'none'
+                            };
+                        }
+                    }, 2000); // 2秒后清理
+
                     return true;
                 } else {
                     // 可能成交失败或延迟，通知服务器
@@ -321,6 +353,7 @@
             }
         } catch (e) {
             log(`下单失败: ${e.message}`, 'error');
+            currentVarOrder.status = 'failed';
 
             // 通知服务器订单失败
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -336,6 +369,22 @@
                     retryCount: currentVarOrder.retryCount
                 }));
             }
+
+            // 订单失败后延迟重置状态，确保服务器已收到失败通知
+            setTimeout(() => {
+                if (currentVarOrder.orderId === orderId) {
+                    log(`清理失败的订单状态: ${orderId}`, 'info');
+                    currentVarOrder = {
+                        orderId: null,
+                        orderType: null,
+                        side: null,
+                        quantity: 0,
+                        retryCount: 0,
+                        createdAt: null,
+                        status: 'none'
+                    };
+                }
+            }, 2000); // 2秒后清理
 
             return false;
         }
